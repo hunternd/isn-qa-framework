@@ -36,10 +36,12 @@ export class ContentAgent {
     visitedUrls: string[],
     pageContent: PageContent,
     lastAction: { action: string; selector: string | null; text: string | null } | null,
-    stepsRemaining: number
+    stepsRemaining: number,
+    bugsLogged: any[] = [],
+    clickedSelectors: string[] = []
   ): Promise<ContentAgentDecision> {
     if (this.isMockMode) {
-      return this.decideMockAction(visitedUrls, pageContent, lastAction);
+      return this.decideMockAction(visitedUrls, pageContent, lastAction, bugsLogged, clickedSelectors);
     }
 
     try {
@@ -50,12 +52,22 @@ export class ContentAgent {
       const response = await this.anthropic.messages.create({
         model: this.model,
         max_tokens: 1000,
-        system: `You are the "Authenticated Content Agent" in an agentic QA framework. Your goal is to systematically verify that links and buttons on the site "https://www.independentsponsor.news/" render the correct semantic content.
+        system: `You are the "Authenticated Content Agent" in an agentic QA framework. Your goal is to systematically verify that links, buttons, and embedded components on "https://www.independentsponsor.news/" render correct semantic content and function properly.
+
 Your capabilities include:
-1. click: Click an article, newsletter, or layout link to inspect its content.
-2. logContentBug: Report a mismatch between the link label/text and the rendered page or modal content (e.g. clicking a link labeled "June 05, 2026 Newsletter" renders a page about "April 2024", or a modal contains blank/incorrect content).
-3. goBack: Return to the previous page in history to check other links.
+1. click: Click an article link, navigation link, or interactive button.
+2. logContentBug: Report a mismatch or defect (e.g., broken links, invalid SoundCloud player embeds, or inactive buttons).
+3. goBack: Return to the previous page in history to verify other links.
 4. finish: Complete your content audit.
+
+Rules for Systematic Auditing:
+- Do NOT stop after logging your first bug. Continue auditing other links on the site.
+- If you log a bug for a page, immediately go back to the index page or navigate to another section to check other elements.
+- Look out for:
+  1. SoundCloud Audio Player errors: Check if there is an error message stating "You have not provided a valid SoundCloud URL" or similar layout failures.
+  2. Dead Action buttons (e.g. "Submit News"): If clicking a button doesn't change the URL, open a form/modal, or update the page content, it is inactive.
+  3. Mismatched Topics: If a link promises one article topic/date but renders another.
+- Refer to the list of already logged bugs so you do not log the exact same bug twice.
 
 User Journey Rules:
 - If you encounter an "Access Denied" page:
@@ -73,6 +85,8 @@ Page Title: ${pageContent.title}
 Last action taken: ${lastAction ? `${lastAction.action} on "${lastAction.selector}" (Text: "${lastAction.text || 'None'}")` : 'None (Starting Page)'}
 Steps remaining in this content audit: ${stepsRemaining}
 Visited pages: ${JSON.stringify(visitedUrls, null, 2)}
+Already clicked elements/selectors in this session: ${JSON.stringify(clickedSelectors, null, 2)}
+Already logged content defects in this session: ${JSON.stringify(bugsLogged, null, 2)}
 
 Interactive Elements on this page:
 ${JSON.stringify(pageContent.interactiveElements.map(el => ({
@@ -81,7 +95,7 @@ ${JSON.stringify(pageContent.interactiveElements.map(el => ({
   selector: el.selector,
 })), null, 2)}
 
-Inspect the current page or select a link to click next. If the page content contradicts what the last clicked link promised, log a content bug.`
+Inspect the current page or select a link to click next. If the page content contradicts what the last clicked link promised, or is broken/inactive, log a content bug.`
           }
         ],
         tools: [
@@ -165,54 +179,101 @@ Inspect the current page or select a link to click next. If the page content con
 
     } catch (err: any) {
       console.error('LLM Content Agent API error, falling back to local crawler logic:', err.message || err);
-      return this.decideMockAction(visitedUrls, pageContent, lastAction);
+      return this.decideMockAction(visitedUrls, pageContent, lastAction, bugsLogged, clickedSelectors);
     }
   }
 
   private decideMockAction(
     visitedUrls: string[],
     pageContent: PageContent,
-    lastAction: { action: string; selector: string | null; text: string | null } | null
+    lastAction: { action: string; selector: string | null; text: string | null } | null,
+    bugsLogged: any[] = [],
+    clickedSelectors: string[] = []
   ): ContentAgentDecision {
-    // 1. If we just clicked a link, let's verify if the current page content matches
-    if (lastAction && lastAction.action === 'CLICK' && lastAction.text) {
-      const clickedText = lastAction.text.toLowerCase();
-      const pageTitle = pageContent.title.toLowerCase();
-
-      // Check for mismatch: e.g. clicked "June 05, 2026 Newsletter" but landed on "Access Denied" or empty page
-      // On the live site, if we try to click a newsletter link and get redirected to "/access-denied",
-      // that is a type of access-related mismatch (or simulated bug)!
-      if (pageContent.url.includes('/access-denied') || pageTitle.includes('access denied')) {
+    // 1. If we just logged a bug, go back to look for other links
+    if (lastAction && lastAction.action === 'LOG_CONTENT_BUG') {
+      if (visitedUrls.length > 1) {
         return {
-          thought: `Local mock decision: Mismatch detected! Clicked link "${lastAction.text}" but got redirected to Access Denied page.`,
-          action: 'LOG_CONTENT_BUG',
-          target: null,
-          params: {
-            linkText: lastAction.text,
-            expectedTopic: 'Newsletter Content',
-            actualTopic: 'Access Denied Page',
-            description: 'Landed on Access Denied page, preventing access to the promised newsletter content.'
-          }
+          thought: 'Local mock decision: Backtracking after logging a content bug.',
+          action: 'BACK',
+          target: null
         };
       }
     }
 
-    // 2. Otherwise, look for an article/newsletter link to check
-    const articleLink = pageContent.interactiveElements.find(el => 
-      el.tagName === 'a' && 
-      (el.text || '').toLowerCase().includes('newsletter') &&
-      !visitedUrls.includes(new URL(el.selector.match(/href="([^"]+)"/)?.[1] || '/', pageContent.url).toString())
-    );
-
-    if (articleLink) {
-      return {
-        thought: `Local mock decision: Click link "${articleLink.text}" to audit its rendered content.`,
-        action: 'CLICK',
-        target: articleLink.selector,
-        params: {
-          linkText: articleLink.text
+    // 2. If we just clicked a link, check for issues on the page
+    if (lastAction && lastAction.action === 'CLICK' && lastAction.text) {
+      const pageTitle = pageContent.title.toLowerCase();
+      const pageText = pageContent.text || '';
+      
+      // Access Denied Check
+      if (pageContent.url.includes('/access-denied') || pageTitle.includes('access denied')) {
+        const bugAlreadyLogged = bugsLogged.some(b => b.url === pageContent.url && b.description.includes('Access Denied'));
+        if (!bugAlreadyLogged) {
+          return {
+            thought: `Local mock decision: Access Denied bug detected on ${pageContent.url}.`,
+            action: 'LOG_CONTENT_BUG',
+            target: null,
+            params: {
+              linkText: lastAction.text,
+              expectedTopic: 'Subscriber Page Content',
+              actualTopic: 'Access Denied',
+              description: 'Landed on Access Denied page when attempting to view subscriber content.'
+            }
+          };
         }
-      };
+      }
+
+      // SoundCloud Player Check
+      if (pageText.includes('You have not provided a valid SoundCloud URL')) {
+        const bugAlreadyLogged = bugsLogged.some(b => b.url === pageContent.url && b.description.includes('SoundCloud'));
+        if (!bugAlreadyLogged) {
+          return {
+            thought: `Local mock decision: Invalid SoundCloud player detected on ${pageContent.url}.`,
+            action: 'LOG_CONTENT_BUG',
+            target: null,
+            params: {
+              linkText: lastAction.text,
+              expectedTopic: 'Valid SoundCloud Player embed',
+              actualTopic: 'Invalid SoundCloud URL message',
+              description: 'SoundCloud widget displays warning: "You have not provided a valid SoundCloud URL."'
+            }
+          };
+        }
+      }
+    }
+
+    // 3. Otherwise, look for an article/newsletter/insight link to audit
+    const unvisitedLinks = pageContent.interactiveElements.filter(el => {
+      if (el.tagName !== 'a') return false;
+      if (clickedSelectors.includes(el.selector)) return false; // Skip if already clicked!
+      
+      const text = (el.text || '').toLowerCase();
+      const href = el.selector.match(/href="([^"]+)"/)?.[1] || '';
+      
+      const isAuditable = text.includes('newsletter') || text.includes('insight') || text.includes('read') || text.includes('submit');
+      if (!isAuditable) return false;
+      
+      try {
+        const absUrl = new URL(href, pageContent.url).toString();
+        return !visitedUrls.includes(absUrl);
+      } catch (e) {
+        return false;
+      }
+    });
+
+    if (unvisitedLinks.length > 0) {
+      const targetLink = unvisitedLinks[0];
+      if (targetLink) {
+        return {
+          thought: `Local mock decision: Click link "${targetLink.text}" to audit its contents.`,
+          action: 'CLICK',
+          target: targetLink.selector,
+          params: {
+            linkText: targetLink.text
+          }
+        };
+      }
     }
 
     // Fallback: click News link or go back
@@ -227,7 +288,7 @@ Inspect the current page or select a link to click next. If the page content con
 
     if (visitedUrls.length > 1) {
       return {
-        thought: 'Local mock decision: Backtracking to check other content links.',
+        thought: 'Local mock decision: No unvisited content links found. Backtracking...',
         action: 'BACK',
         target: null
       };
