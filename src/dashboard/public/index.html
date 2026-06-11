@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ISN QA Agent Framework Dashboard</title>
+  
+  <!-- Typography & Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  
+  <!-- CDNs for Rich MD rendering and Mermaid diagrams -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  
+  <!-- Custom Styling -->
+  <link rel="stylesheet" href="/style.css?v=1.0.2">
+</head>
+<body>
+  <!-- Background Glows -->
+  <div class="glow-sphere glow-1"></div>
+  <div class="glow-sphere glow-2"></div>
+
+  <!-- App Wrapper -->
+  <div class="app-container">
+    
+    <!-- Top Header Bar -->
+    <header class="app-header">
+      <div class="logo-area">
+        <div class="logo-icon">
+          <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            <path d="M9 11l2 2 4-4"/>
+          </svg>
+        </div>
+        <div class="logo-text">
+          <h1>ISN QA Framework</h1>
+          <p>Autonomous AI Test Cockpit</p>
+        </div>
+      </div>
+      
+      <!-- Live Metrics Overview -->
+      <div class="header-metrics">
+        <div class="metric-card" id="metric-runs">
+          <span class="metric-label">Total Runs</span>
+          <span class="metric-value">0</span>
+        </div>
+        <div class="metric-card" id="metric-bugs">
+          <span class="metric-label">Defects Logged</span>
+          <span class="metric-value">0</span>
+        </div>
+      </div>
+
+      <!-- Action Area (Run Spec Subprocesses) -->
+      <div class="header-actions">
+        <div class="runner-dropdown">
+          <select id="suite-selector">
+            <option value="coordinated">Coordinated Multi-Agent Audit</option>
+            <option value="content">Content Integrity Scan</option>
+            <option value="specialized">Specialized UI & Security Scan</option>
+            <option value="exploration">Exploratory Navigation Map</option>
+            <option value="user-journey">Interactive User Journey</option>
+            <option value="auth">Perform Login (Save Cache)</option>
+          </select>
+        </div>
+        <button id="run-btn" class="btn btn-primary">
+          <svg class="icon" viewBox="0 0 24 24" fill="currentColor">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+          Run Test Suite
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Workspace Layout -->
+    <main class="app-main">
+      
+      <!-- Left Sidebar: History List -->
+      <section class="sidebar-panel">
+        <div class="panel-header">
+          <h2>Run History</h2>
+          <button id="refresh-btn" class="btn-icon" title="Refresh Report List">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+            </svg>
+          </button>
+        </div>
+
+        <!-- Filters -->
+        <div class="filters-bar">
+          <button class="filter-tab active" data-filter="all">All</button>
+          <button class="filter-tab" data-filter="executive">Executive</button>
+          <button class="filter-tab" data-filter="content">Content</button>
+          <button class="filter-tab" data-filter="ui_ux">UI/UX</button>
+          <button class="filter-tab" data-filter="security">Security</button>
+          <button class="filter-tab" data-filter="navigation">Nav</button>
+        </div>
+
+        <div class="search-box">
+          <input type="text" id="report-search" placeholder="Search by domain, date, status...">
+          <label class="toggle-label">
+            <input type="checkbox" id="latest-only-checkbox" checked>
+            Show only latest of each type
+          </label>
+        </div>
+
+        <!-- Report Cards List -->
+        <div class="report-list" id="report-list-container">
+          <div class="loading-state">
+            <div class="spinner"></div>
+            <p>Loading historical audits...</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Panel: Report Details -->
+      <section class="details-panel" id="details-panel-container">
+        <!-- Default State when no report selected -->
+        <div class="no-selection-state">
+          <div class="empty-icon">
+            <svg viewBox="0 0 24 24" width="64" height="64" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+              <line x1="16" y1="13" x2="8" y2="13"/>
+              <line x1="16" y1="17" x2="8" y2="17"/>
+              <polyline points="10 9 9 9 8 9"/>
+            </svg>
+          </div>
+          <h3>No Audit Run Selected</h3>
+          <p>Select a run from the history list to inspect findings, view sitemaps, browse screenshots, and review test actions.</p>
+        </div>
+
+        <!-- Content Area (Initially Hidden) -->
+        <div class="report-details-wrapper" style="display: none;">
+          <!-- Report Header -->
+          <div class="report-detail-header">
+            <div class="title-and-site">
+              <h2 id="detail-report-title">Coordinated QA Executive Report</h2>
+              <div class="meta-row">
+                <span class="meta-item" id="detail-target-site">
+                  <svg class="meta-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/>
+                    <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+                  </svg>
+                  <span>https://www.independentsponsor.news/</span>
+                </span>
+                <span class="meta-item" id="detail-report-date">
+                  <svg class="meta-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+                  </svg>
+                  <span>6/11/2026, 1:33:20 PM</span>
+                </span>
+              </div>
+            </div>
+            
+            <div class="detail-badge-area" id="detail-badge-container">
+              <!-- Dynamically populated -->
+            </div>
+          </div>
+
+          <!-- Report Tabs -->
+          <div class="tab-controls">
+            <button class="tab-btn active" data-tab="content">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+              Report Summary
+            </button>
+            <button class="tab-btn" data-tab="sitemap" id="tab-sitemap-btn">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+              Sitemap Diagram
+            </button>
+            <button class="tab-btn" data-tab="screenshots">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+              Screenshots (<span id="detail-screenshot-count">0</span>)
+            </button>
+            <button class="tab-btn" data-tab="console" id="tab-console-btn">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+              Runner Console
+            </button>
+          </div>
+
+          <!-- Tab Content Panels -->
+          <div class="tab-panels">
+            
+            <!-- Panel 1: Rendered MD Content -->
+            <div class="tab-panel active" id="panel-content">
+              <div class="markdown-body" id="markdown-viewer">
+                <!-- Populated by Marked.js -->
+              </div>
+            </div>
+
+            <!-- Panel 2: Mermaid Sitemap Visualizer -->
+            <div class="tab-panel" id="panel-sitemap">
+              <div class="sitemap-container">
+                <div class="mermaid-output-wrapper">
+                  <div class="mermaid" id="mermaid-sitemap-viewer">
+                    <!-- Populated dynamically -->
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Panel 3: Screenshot Gallery -->
+            <div class="tab-panel" id="panel-screenshots">
+              <div class="screenshots-grid" id="screenshots-grid-container">
+                <!-- Dynamically populated -->
+              </div>
+            </div>
+
+            <!-- Panel 4: Terminal Runner Console -->
+            <div class="tab-panel" id="panel-console">
+              <div class="terminal-wrapper">
+                <div class="terminal-header">
+                  <div class="terminal-dots">
+                    <span class="dot red"></span>
+                    <span class="dot yellow"></span>
+                    <span class="dot green"></span>
+                  </div>
+                  <div class="terminal-title">Runner Output Log</div>
+                  <div class="terminal-actions">
+                    <span class="status-indicator idle" id="console-status-indicator">
+                      <span class="pulse-ring"></span>
+                      <span class="status-text">IDLE</span>
+                    </span>
+                    <button id="clear-console-btn" class="btn-small">Clear</button>
+                  </div>
+                </div>
+                <div class="terminal-body" id="console-output-logs">
+                  <div class="system-line">[SYSTEM] Console ready. Select a test suite and click "Run Test Suite" to execute. Logs will stream here live.</div>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- Lightbox Modal for Screenshots -->
+  <div class="lightbox-modal" id="lightbox" style="display: none;">
+    <div class="lightbox-overlay" onclick="closeLightbox()"></div>
+    <div class="lightbox-content">
+      <button class="lightbox-close" onclick="closeLightbox()">&times;</button>
+      <img id="lightbox-img" src="" alt="Full Screen Shot">
+      <div class="lightbox-caption" id="lightbox-caption"></div>
+    </div>
+  </div>
+
+  <!-- Custom Scripts -->
+  <script src="/app.js"></script>
+</body>
+</html>

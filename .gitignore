@@ -1,1 +1,6 @@
-node_modules/\nplaywright-report/\ntest-results/\n.env
+node_modules/
+playwright-report/
+test-results/
+.env
+.env.local
+reports/
