@@ -37,6 +37,7 @@ export class AgentRunner {
   private bugsLogged: AuditBug[] = [];
   private securityFindings: SecurityFinding[] = [];
   private contentBugsLogged: ContentBug[] = [];
+  private clickedSelectors: string[] = [];
   private currentViewport = { width: 1280, height: 800 };
 
   constructor(page: Page, baseUrl: string) {
@@ -307,6 +308,62 @@ export class AgentRunner {
 
   async runContentAgent(agentInstance: any, maxSteps = 10): Promise<void> {
     console.log(`\n🚀 Starting Content Context & Integrity Audit at: ${this.baseUrl}`);
+
+    // Listen for new tab openings
+    const context = this.page.context();
+    const handleNewPage = async (newPage: any) => {
+      console.log(`🌐 [New Tab Detector] Detected new tab opening...`);
+      try {
+        await newPage.waitForLoadState('domcontentloaded', { timeout: 10000 });
+        const newUrl = newPage.url();
+        const newTitle = await newPage.title().catch(() => 'Untitled');
+        console.log(`🌐 [New Tab Detector] Loaded: "${newTitle}" | URL: ${newUrl}`);
+
+        // Take a screenshot of the new tab
+        const pageTitleSanitized = newTitle.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+        const screenshotName = `content_tab_${Date.now()}_${pageTitleSanitized}`;
+        const screenshotRes = await takeScreenshot(newPage, screenshotName);
+        if (screenshotRes.success && screenshotRes.filePath) {
+          this.screenshots[newUrl] = screenshotRes.filePath;
+        }
+
+        // Scan page text for common error cues
+        const bodyText = await newPage.locator('body').innerText().catch(() => '');
+        
+        // 1. Check for unresolved placeholders in the URL
+        if (newUrl.includes('SUBSCRIBER_ID') || newUrl.includes('placeholder')) {
+          this.contentBugsLogged.push({
+            linkText: lastAction?.text || 'External Link',
+            expectedTopic: 'Substituted subscriber page URL',
+            actualTopic: 'Placeholder URL',
+            description: `New tab opened to a template URL containing unresolved placeholders: "${newUrl}"`,
+            url: newUrl,
+            timestamp: new Date().toISOString()
+          });
+          console.log(`🐞 Logged Content Bug: [New tab has unresolved placeholder: ${newUrl}]`);
+        } 
+        // 2. Check for 404 page errors
+        else if (newTitle.includes('404') || newTitle.toLowerCase().includes('not found') || bodyText.toLowerCase().includes('page not found')) {
+          this.contentBugsLogged.push({
+            linkText: lastAction?.text || 'External Link',
+            expectedTopic: 'Active target page content',
+            actualTopic: '404 Not Found / Error Page',
+            description: `New tab opened to a broken link resulting in a 404 page error: "${newUrl}"`,
+            url: newUrl,
+            timestamp: new Date().toISOString()
+          });
+          console.log(`🐞 Logged Content Bug: [New tab is a 404 page: ${newUrl}]`);
+        }
+
+        // Close the tab to save resources
+        await newPage.close();
+      } catch (err: any) {
+        console.error(`❌ [New Tab Detector] Error auditing new tab:`, err.message || err);
+      }
+    };
+    
+    context.on('page', handleNewPage);
+
     await navigate(this.page, '/');
     let currentUrl = this.page.url();
     this.visitedUrls.push(currentUrl);
@@ -345,13 +402,44 @@ export class AgentRunner {
       // Read page content
       const pageContent = await readPageContent(this.page);
 
+      // SoundCloud Verification (Frame Scanner)
+      let soundCloudErrorFound = false;
+      for (const frame of this.page.frames()) {
+        try {
+          const bodyText = await frame.locator('body').innerText();
+          if (bodyText && bodyText.includes('You have not provided a valid SoundCloud URL')) {
+            soundCloudErrorFound = true;
+            break;
+          }
+        } catch (e) {
+          // ignore cross-origin frames
+        }
+      }
+      if (soundCloudErrorFound) {
+        const alreadyLogged = this.contentBugsLogged.some(b => b.url === currentUrl && b.description.includes('SoundCloud'));
+        if (!alreadyLogged) {
+          this.contentBugsLogged.push({
+            linkText: lastAction?.text || 'SoundCloud Embed',
+            expectedTopic: 'Valid SoundCloud Audio Player',
+            actualTopic: 'SoundCloud URL Error Message',
+            description: 'The embedded SoundCloud player iframe displays: "You have not provided a valid SoundCloud URL. Learn more about using SoundCloud players."',
+            url: currentUrl,
+            timestamp: new Date().toISOString()
+          });
+          console.log(`🐞 Logged Content Bug: [SoundCloud embed error on ${currentUrl}]`);
+          lastAction = { action: 'LOG_CONTENT_BUG', selector: null, text: null };
+        }
+      }
+
       // Consult LLM
       const stepsRemaining = maxSteps - steps;
       const decision: any = await agentInstance.decideNextAction(
         this.visitedUrls,
         pageContent,
         lastAction,
-        stepsRemaining
+        stepsRemaining,
+        this.contentBugsLogged,
+        this.clickedSelectors
       );
 
       console.log(`Thought: "${decision.thought}"`);
@@ -371,11 +459,18 @@ export class AgentRunner {
 
       if (decision.action === 'CLICK' && decision.target) {
         const elInfo = pageContent.interactiveElements.find(el => el.selector === decision.target);
+        
+        // Dead click detection pre-state
+        const preClickUrl = this.page.url();
+        const preClickText = await this.page.locator('body').innerText().catch(() => '');
+
         lastAction = {
           action: 'CLICK',
           selector: decision.target,
           text: elInfo ? (elInfo.text || decision.params?.linkText || null) : (decision.params?.linkText || null)
         };
+
+        this.clickedSelectors.push(decision.target);
 
         const clickRes = await clickElement(this.page, decision.target);
         await this.page.waitForTimeout(1500); // Wait for page/modal transitions
@@ -384,8 +479,30 @@ export class AgentRunner {
         if (!clickRes.success) {
           this.actionHistory[this.actionHistory.length - 1]!.result = 'failed';
           this.actionHistory[this.actionHistory.length - 1]!.error = clickRes.error;
-        } else if (!this.visitedUrls.includes(currentUrl)) {
-          this.visitedUrls.push(currentUrl);
+        } else {
+          if (!this.visitedUrls.includes(currentUrl)) {
+            this.visitedUrls.push(currentUrl);
+          }
+          
+          // Dead click detection post-state
+          const postClickText = await this.page.locator('body').innerText().catch(() => '');
+          const isSubmitNews = (lastAction.text || '').toLowerCase().includes('submit news');
+          
+          if (preClickUrl === currentUrl && preClickText === postClickText && isSubmitNews) {
+            const alreadyLogged = this.contentBugsLogged.some(b => b.url === currentUrl && b.linkText.includes('Submit News'));
+            if (!alreadyLogged) {
+              this.contentBugsLogged.push({
+                linkText: lastAction.text || 'Submit News',
+                expectedTopic: 'Navigation to News Submission Form or Modal opening',
+                actualTopic: 'No transition (button is dead)',
+                description: 'Clicking the "Submit News" button/link did not navigate, open a modal, or update page content.',
+                url: currentUrl,
+                timestamp: new Date().toISOString()
+              });
+              console.log(`🐞 Logged Content Bug: [Submit News button is dead on ${currentUrl}]`);
+              lastAction = { action: 'LOG_CONTENT_BUG', selector: null, text: null };
+            }
+          }
         }
       } else if (decision.action === 'LOG_CONTENT_BUG' && decision.params) {
         const { linkText, expectedTopic, actualTopic, description } = decision.params;
@@ -398,6 +515,7 @@ export class AgentRunner {
           timestamp: new Date().toISOString()
         });
         console.log(`🐞 Logged Content Bug: [promised "${expectedTopic}" but loaded "${actualTopic}"]`);
+        lastAction = { action: 'LOG_CONTENT_BUG', selector: null, text: null };
       } else if (decision.action === 'BACK') {
         try {
           await this.page.goBack();
@@ -410,6 +528,7 @@ export class AgentRunner {
       }
     }
 
+    context.off('page', handleNewPage);
     await this.saveContentReport();
   }
 

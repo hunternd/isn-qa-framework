@@ -4,7 +4,7 @@ import { ContentAgent } from '../src/agents/content-agent.js';
 import { loginAndSaveSession, hasSession } from '../src/engine/auth.js';
 
 test.describe('Content Context & Integrity Agent Audit', () => {
-  test.setTimeout(90000);
+  test.setTimeout(180000);
 
   const baseUrl = 'https://www.independentsponsor.news/';
 
@@ -23,8 +23,8 @@ test.describe('Content Context & Integrity Agent Audit', () => {
     const runner = new AgentRunner(page, baseUrl);
     const agent = new ContentAgent();
 
-    // 3. Execute content audit loop (max 6 steps)
-    await runner.runContentAgent(agent, 6);
+    // 3. Execute content audit loop (max 15 steps)
+    await runner.runContentAgent(agent, 15);
     console.log('Content Agent audit complete.');
   });
 });
