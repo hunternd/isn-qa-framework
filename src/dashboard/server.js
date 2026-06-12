@@ -39,6 +39,7 @@ function parseReportMeta(filename, content) {
   else if (filename.startsWith('navigation_report')) type = 'navigation';
   else if (filename.startsWith('security_report')) type = 'security';
   else if (filename.startsWith('ui_ux_report')) type = 'ui_ux';
+  else if (filename.startsWith('scenario_report')) type = 'scenario';
 
   // Extract Date
   const dateMatch = content.match(/-\s+\*\*Date\*\*:\s*([^\n\r]+)/i);
@@ -70,6 +71,14 @@ function parseReportMeta(filename, content) {
     if (brokenLinksMatch) navBugs += parseInt(brokenLinksMatch[1], 10);
     if (consoleErrMatch) navBugs += parseInt(consoleErrMatch[1], 10);
     bugsCount = navBugs;
+  } else if (type === 'scenario') {
+    // Scenarios are pass/fail. Surface as bug count = 0 when pass, otherwise
+    // count failed steps so the card shows a defect badge on failure.
+    const statusMatch = content.match(/-\s+\*\*Status\*\*:\s*(✅\s*PASS|❌\s*FAIL)/i);
+    if (statusMatch && /FAIL/i.test(statusMatch[1])) {
+      const stepsMatch = content.match(/-\s+\*\*Steps\*\*:.*?(\d+)\s+failed/i);
+      bugsCount = stepsMatch ? parseInt(stepsMatch[1], 10) : 1;
+    }
   } else if (type === 'executive') {
     const healthErrors = content.match(/Broken Link Health Errors\*\*:\s*(?:✅\s*0|(\d+))/i);
     const uxIssues = content.match(/Visual\/UX Issues Logged\*\*:\s*(?:✅\s*0|(\d+))/i);

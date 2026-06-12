@@ -408,6 +408,7 @@ body {
 .report-type-badge.ui_ux { color: #f43f5e; }
 .report-type-badge.security { color: var(--accent-green); }
 .report-type-badge.navigation { color: var(--accent-yellow); }
+.report-type-badge.scenario { color: #fb923c; }
 
 .card-status {
   padding: 0.15rem 0.45rem;

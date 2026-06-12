@@ -2,8 +2,8 @@ import { test, expect } from '@playwright/test';
 import { NavigationOrchestrator } from '../src/engine/orchestrator.js';
 
 test('run autonomous navigation exploration on target site', async ({ page }) => {
-  // Set test timeout to 60 seconds because exploring multiple pages can take time
-  test.setTimeout(60000);
+  // Bumped from 60s to 180s — LLM call per step ~8–12s; 10 steps fits comfortably in 3 min.
+  test.setTimeout(180000);
 
   console.log('Initializing Navigation Orchestrator...');
   const baseUrl = 'https://www.independentsponsor.news/';

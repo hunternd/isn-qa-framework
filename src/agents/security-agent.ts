@@ -30,10 +30,15 @@ export class SecurityAgent {
   async decideNextAction(
     visitedUrls: string[],
     pageContent: PageContent,
-    stepsRemaining: number
+    stepsRemaining: number,
+    clickedSelectors: string[] = [],
+    visitedSections: string[] = [],
+    urlStreak: number = 0,
+    findingsLogged: any[] = [],
+    typedPairs: string[] = []
   ): Promise<SecurityAgentDecision> {
     if (this.isMockMode) {
-      return this.decideMockAction(visitedUrls, pageContent);
+      return this.decideMockAction(visitedUrls, pageContent, clickedSelectors, visitedSections);
     }
 
     try {
@@ -41,31 +46,68 @@ export class SecurityAgent {
         throw new Error('Anthropic client is not initialized.');
       }
 
+      const KNOWN_SECTIONS = ['home', 'newsletters', 'insights', 'news', 'about', 'contact', 'privacy-policy', 'terms-of-use'];
+      const unvisitedSections = KNOWN_SECTIONS.filter(s => !visitedSections.includes(s));
+      const currentSection = (() => {
+        try {
+          const u = new URL(pageContent.url);
+          const segs = u.pathname.split('/').filter(s => s.length > 0);
+          return segs.length === 0 ? 'home' : segs[0]!;
+        } catch {
+          return 'unknown';
+        }
+      })();
+
       const response = await this.anthropic.messages.create({
         model: this.model,
         max_tokens: 1000,
-        system: `You are the "Security & Auth Agent" in an agentic QA framework. Your goal is to inspect the site "https://www.independentsponsor.news/", audit search boxes, subscription inputs, and contact forms for vulnerability exposures or input validation gaps.
-Your capabilities include:
-1. type: Input text into an input or textarea element (e.g. testing boundary inputs, script tags, SQL symbols, or invalid structures).
-2. click: Click a form submit button or checkbox.
-3. goBack: Return to the previous page in history.
-4. logSecurity: Report a specific security vulnerability, boundary issue, or raw application stack dump you encountered.
-5. finish: Complete your auditing task.
+        system: `You are a QA security auditor inspecting input handling on https://www.independentsponsor.news/. Forms and inputs are scattered across sections (contact, subscribe, search, comment, newsletter signup), so your job is BREADTH-FIRST — find and probe as many distinct input surfaces across the site as you can.
 
-Rules:
-- Identify form textareas or input fields on the page.
-- Test form validation handling by inputting invalid structured strings (e.g., test invalid emails, boundary values, or basic script strings '<script>').
-- Never perform destructive actions. Keep audits clean, non-intrusive, and local.
-- Check how the system handles invalid forms (e.g., does it reveal detailed stack errors in page HTML, or validate gracefully?).`,
+Coverage targets for this audit:
+- Visit at least 2 different sections with forms or inputs (contact, subscribe widget, newsletter signup, search, etc.).
+- Test at least 2 distinct input fields with non-destructive boundary payloads (invalid email format, oversized strings, basic XSS-style markers like \`<script>\`, SQL-like quotes).
+- After auditing the inputs on one page, MOVE to a different section.
+
+Hard constraints (the runner will override you if you violate these):
+- NEVER pick a selector that already appears in "Already clicked selectors". The runner will substitute a fresh one.
+- NEVER type a (selector, payload) pair that already appears in "Already typed pairs". Same input with a DIFFERENT payload is fine (boundary testing). Same input + same payload is wasted; pick a different input, a different payload, or navigate to a new section. The runner will reject exact repeats.
+- NEVER perform destructive actions (do not submit account changes, do not send messages with real-looking content, do not post). Use non-intrusive, clearly-test-only payloads.
+- If urlStreak >= 1 your last click did not navigate; pick a link to a DIFFERENT section or use goBack.
+
+What to look for:
+- Forms that reveal raw stack traces, server errors, or internal field names when invalid input is submitted.
+- Forms that strip dangerous input gracefully vs forms that echo \`<script>\` markers back unescaped into the page.
+- Email or URL inputs that accept obviously malformed values without client-side validation.
+- Hidden inputs containing sensitive-looking values (tokens, IDs) exposed in the DOM.
+- Forms missing CSRF tokens, autocomplete on password-like fields, etc.
+
+Use logSecurity for any of the above. Don't bother re-logging duplicates.
+
+When 2+ sections + 2+ inputs have been probed and remaining steps are low, use finish with a summary.`,
         messages: [
           {
             role: 'user',
             content: `Current page URL: ${pageContent.url}
-Page Title: ${pageContent.title}
-Steps remaining in this security inspection: ${stepsRemaining}
-Visited pages so far: ${JSON.stringify(visitedUrls, null, 2)}
+Current section: ${currentSection}
+Page title: ${pageContent.title}
+Steps remaining: ${stepsRemaining}
+URL streak: ${urlStreak} (consecutive prior steps ending at the SAME URL — if >= 1, your last click didn't navigate)
 
-Interactive Elements on this page:
+Coverage so far:
+- Sections visited: ${JSON.stringify(visitedSections)}
+- Likely-unvisited sections: ${JSON.stringify(unvisitedSections)}
+- Distinct selectors clicked: ${clickedSelectors.length}
+
+Already clicked selectors (DO NOT re-pick; runner will reject):
+${JSON.stringify(clickedSelectors, null, 2)}
+
+Already typed (selector | payload) pairs (DO NOT repeat exact pairs; runner will reject):
+${JSON.stringify(typedPairs, null, 2)}
+
+Already logged security findings (do not re-log):
+${JSON.stringify(findingsLogged.map((f: any) => ({ id: f.id, severity: f.severity, selector: f.elementSelector })), null, 2)}
+
+Interactive elements on this page (pick from these for type/click, or use goBack/finish):
 ${JSON.stringify(pageContent.interactiveElements.map(el => ({
   tag: el.tagName,
   type: el.type,
@@ -74,7 +116,7 @@ ${JSON.stringify(pageContent.interactiveElements.map(el => ({
   placeholder: el.placeholder,
 })), null, 2)}
 
-Select the next action using one of the tools provided.`
+Pick the next action. Strongly prefer (1) typing a boundary payload into an unprobed input on this page, (2) navigating to an unvisited section to find more inputs, or (3) logging a real validation issue you observed.`
           }
         ],
         tools: [
@@ -161,47 +203,55 @@ Select the next action using one of the tools provided.`
 
     } catch (err: any) {
       console.error('LLM Security Agent API error, falling back to local crawler logic:', err.message || err);
-      return this.decideMockAction(visitedUrls, pageContent);
+      return this.decideMockAction(visitedUrls, pageContent, clickedSelectors, visitedSections);
     }
   }
 
-  private decideMockAction(visitedUrls: string[], pageContent: PageContent): SecurityAgentDecision {
-    // In mock mode, we look for input fields (inputs or textareas)
+  private decideMockAction(
+    visitedUrls: string[],
+    pageContent: PageContent,
+    clickedSelectors: string[] = [],
+    visitedSections: string[] = [],
+  ): SecurityAgentDecision {
+    // First try a fresh input on this page (one we haven't typed into yet).
     const inputs = pageContent.interactiveElements.filter(el =>
-      (el.tagName === 'input' && el.type !== 'submit' && el.type !== 'button') || el.tagName === 'textarea'
+      ((el.tagName === 'input' && el.type !== 'submit' && el.type !== 'button') || el.tagName === 'textarea')
+      && !clickedSelectors.includes(el.selector)
     );
 
     if (inputs.length > 0 && inputs[0]) {
       const targetInput = inputs[0];
-      // Let's type an invalid email format to test validation
       return {
-        thought: `Local mock decision: Found input field "${targetInput.selector}". Type boundary email validation check.`,
+        thought: `Local mock decision: type a boundary email payload into fresh input "${targetInput.selector}".`,
         action: 'TYPE',
         target: targetInput.selector,
         params: { text: 'test-invalid-email-format' }
       };
     }
 
-    // Now log a mock security audit observation
-    if (pageContent.url.includes('/contact')) {
+    // Try to navigate to an unvisited section — same heuristic as the UI mock.
+    const sectionFromHref = (href: string): string => {
+      try {
+        const u = new URL(href, pageContent.url);
+        const segs = u.pathname.split('/').filter(s => s.length > 0);
+        return segs.length === 0 ? 'home' : segs[0]!;
+      } catch {
+        return 'unknown';
+      }
+    };
+    const sectionLink = pageContent.interactiveElements.find(el => {
+      if (el.tagName !== 'a') return false;
+      if (clickedSelectors.includes(el.selector)) return false;
+      const hrefMatch = el.selector.match(/href="([^"]+)"/);
+      const href = hrefMatch?.[1] || '';
+      if (!href || href.startsWith('#') || /^https?:\/\//.test(href)) return false;
+      return !visitedSections.includes(sectionFromHref(href));
+    });
+    if (sectionLink) {
       return {
-        thought: 'Local mock decision: Log standard observation regarding input sanitization on inputs.',
-        action: 'LOG_SECURITY',
-        target: 'input[type="email"]',
-        params: {
-          severity: 'low',
-          description: 'Verified subscription form. Input fields trigger proper HTML5 native client-side validation for emails.'
-        }
-      };
-    }
-
-    // Fallback: Click Contact menu link to look for forms
-    const contactLink = pageContent.interactiveElements.find(el => (el.text || '').toLowerCase().includes('contact'));
-    if (contactLink && !visitedUrls.includes(new URL('/contact', pageContent.url).toString())) {
-      return {
-        thought: 'Local mock decision: Navigate to Contact section to audit input forms.',
+        thought: `Local mock decision: navigate to an unvisited section via "${sectionLink.text || sectionLink.selector}" to find more inputs.`,
         action: 'CLICK',
-        target: contactLink.selector
+        target: sectionLink.selector,
       };
     }
 
