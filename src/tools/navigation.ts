@@ -142,17 +142,89 @@ export async function readPageContent(page: Page): Promise<PageContent> {
       return selector;
     }
 
+    // Targeted check for the most common framework dropdown pattern that slips
+    // past CSS-based visibility checks: Webflow uses `.w-dropdown-list` for the
+    // container and applies `.w--open` only when expanded. Generic ARIA menus
+    // can also expose state via aria-expanded.
+    function isInsideClosedDropdown(el: Element): boolean {
+      let current: Element | null = el;
+      while (current) {
+        if (current.classList && current.classList.contains('w-dropdown-list')) {
+          return !current.classList.contains('w--open');
+        }
+        const role = current.getAttribute('role');
+        if (role === 'menu' && current.getAttribute('aria-expanded') === 'false') {
+          return true;
+        }
+        current = current.parentElement;
+      }
+      return false;
+    }
+
+    // Walks ancestors AND hit-tests the element to confirm it's actually visible.
+    // The previous version only inspected the element itself, which let Webflow
+    // nav dropdown items slip through — they have a non-zero rect even when the
+    // parent dropdown is collapsed via transform: scaleY(0) or off-screen
+    // positioning. The hit-test catches anything that isn't actually reachable
+    // by a click at its own center coordinate.
+    function isReallyVisible(el: Element): boolean {
+      if (isInsideClosedDropdown(el)) return false;
+      // 1. Modern checkVisibility API — handles display, visibility, opacity,
+      //    content-visibility, and ancestors in one call.
+      const maybeCheck = (el as Element & { checkVisibility?: (opts?: object) => boolean }).checkVisibility;
+      if (typeof maybeCheck === 'function') {
+        if (!maybeCheck.call(el, { checkOpacity: true, checkVisibilityCSS: true })) {
+          return false;
+        }
+      }
+      // 2. Ancestor walk picks up aria-hidden, hidden attr, and CSS states that
+      //    checkVisibility may handle differently across browsers.
+      let current: Element | null = el;
+      while (current) {
+        const style = window.getComputedStyle(current);
+        if (style.display === 'none') return false;
+        if (style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+        if (parseFloat(style.opacity) === 0) return false;
+        if (current.getAttribute('aria-hidden') === 'true') return false;
+        if (current.hasAttribute('hidden')) return false;
+        current = current.parentElement;
+      }
+      // 3. Non-zero rect check.
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+
+      // 4. Off-screen positioning trick (e.g. position: absolute; top: -9999px).
+      //    Allow elements below the fold (reachable via scroll) but reject anything
+      //    pushed far off the left/top edge.
+      if (rect.right < -50 || rect.bottom < -50) return false;
+      if (rect.left > window.innerWidth + 1000) return false;
+
+      // 5. Hit-test at the element's own center. If something else is at the top
+      //    (a collapsed parent's transparent overlay, a sticky cookie banner,
+      //    a transform-collapsed dropdown wrapper), the click will be intercepted
+      //    and our agent will burn steps timing out. Skip the hit-test when the
+      //    center is outside the viewport — the user can still scroll to it.
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const inViewport = cx >= 0 && cx <= window.innerWidth && cy >= 0 && cy <= window.innerHeight;
+      if (inViewport) {
+        const topEl = document.elementFromPoint(cx, cy);
+        if (!topEl) return false;
+        // Accept the element itself, any descendant (e.g. icon inside a button),
+        // and any ancestor that wraps it transparently.
+        if (topEl !== el && !el.contains(topEl) && !topEl.contains(el)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
     // Find links, buttons, inputs, selects, textareas, and elements with roles like button
     const querySelectors = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="checkbox"]';
     const foundElements = document.querySelectorAll(querySelectors);
 
     foundElements.forEach(el => {
-      // Basic visibility check
-      const rect = el.getBoundingClientRect();
-      const style = window.getComputedStyle(el);
-      const isVisible = rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-
-      if (isVisible) {
+      if (isReallyVisible(el)) {
         elements.push({
           tagName: el.tagName.toLowerCase(),
           type: el.getAttribute('type') || undefined,
