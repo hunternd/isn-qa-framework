@@ -83,6 +83,54 @@ export class CrossAgentOrchestrator {
     return result;
   }
 
+  // Strip credential-bearing query params from URLs before rendering them
+  // (mirrors AgentRunner.redactUrl — same patterns).
+  private static REDACT_PARAM_REGEX = /([?&])(access_token|id_token|refresh_token|token|jwt|oauth_token|api_key|authorization|password)=([^&#]+)/gi;
+  private static REDACT_JWT_VALUE_REGEX = /=eyJ[A-Za-z0-9_.-]{20,}/g;
+  private static redactUrl(url: string | null | undefined): string {
+    if (!url) return url ?? '';
+    return url
+      .replace(CrossAgentOrchestrator.REDACT_PARAM_REGEX, '$1$2=[REDACTED]')
+      .replace(CrossAgentOrchestrator.REDACT_JWT_VALUE_REGEX, '=eyJ[REDACTED]');
+  }
+
+  private static truncate(s: string, n: number): string {
+    if (!s) return '';
+    return s.length <= n ? s : s.slice(0, n) + '…';
+  }
+
+  private static severityBadge(sev: string): string {
+    const s = (sev || '').toLowerCase();
+    if (s === 'high') return '🔴 P1';
+    if (s === 'medium') return '🟠 P2';
+    if (s === 'low') return '🟡 P3';
+    return '⚪️ —';
+  }
+
+  // Group by defect type + URL host+path + element selector. The same UI bug
+  // surfacing at three viewports, or the same security finding on the same
+  // input across two probe payloads, collapses to a single card with N
+  // instances — same logic that already deduplicates content defects.
+  private groupByRootCause<T extends { type?: string; issueType?: string; url: string; elementSelector?: string }>(items: T[]): Map<string, T[]> {
+    const groups = new Map<string, T[]>();
+    for (const item of items) {
+      let urlKey: string;
+      try {
+        const u = new URL(item.url);
+        urlKey = `${u.host}${u.pathname}`;
+      } catch {
+        urlKey = item.url;
+      }
+      const typeKey = (item.type || item.issueType || 'UNTYPED').toLowerCase();
+      const selKey = (item.elementSelector || '').slice(0, 80);
+      const key = `${typeKey}|${urlKey}|${selKey}`;
+      const arr = groups.get(key) ?? [];
+      arr.push(item);
+      groups.set(key, arr);
+    }
+    return groups;
+  }
+
   private async compileExecutiveReport(navState: any, uiRunner: any, secRunner: any): Promise<CoordinatedQAResult> {
     const reportDir = path.resolve(process.cwd(), 'reports');
     if (!fs.existsSync(reportDir)) {
@@ -92,19 +140,27 @@ export class CrossAgentOrchestrator {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const reportPath = path.join(reportDir, `executive_qa_report_${timestamp}.md`);
 
-    // Compile values
     const visitedPages = navState.visitedUrls;
     const brokenLinks = navState.brokenLinks;
-    const consoleErrors = (navOrchestratorInstance: any) => {
-      // Gather errors from orchestrator listeners
-      return (navOrchestratorInstance as any).consoleErrors || [];
-    };
-    
-    // Access logs from runners using internal fields
-    const uiBugs = (uiRunner as any).bugsLogged || [];
-    const securityObservations = (secRunner as any).securityFindings || [];
+    const consoleErrors = (navState as any).consoleErrors ?? [];
 
-    // Sitemap Mermaid compilation
+    const uiBugs = (uiRunner as any).bugsLogged || [];
+    const securityFindings = (secRunner as any).securityFindings || [];
+
+    const uiGroups = this.groupByRootCause(uiBugs);
+    const secGroups = this.groupByRootCause(securityFindings);
+
+    // Severity counts across all sources (broken links + console errors
+    // count as P1 by definition since they're observable runtime failures).
+    const countSeverity = (items: any[], sev: string) =>
+      items.filter(i => (i.severity || '').toLowerCase() === sev).length;
+    const p1 = countSeverity(uiBugs, 'high') + countSeverity(securityFindings, 'high') + brokenLinks.length + consoleErrors.length;
+    const p2 = countSeverity(uiBugs, 'medium') + countSeverity(securityFindings, 'medium');
+    const p3 = countSeverity(uiBugs, 'low') + countSeverity(securityFindings, 'low');
+    const distinctTotal = uiGroups.size + secGroups.size + brokenLinks.length + consoleErrors.length;
+    const totalInstances = uiBugs.length + securityFindings.length + brokenLinks.length + consoleErrors.length;
+
+    // Sitemap Mermaid
     let mermaid = `graph TD\n`;
     if (Object.keys(navState.siteMap).length === 0) {
       mermaid += `    "/" --> "No transitions recorded."\n`;
@@ -118,68 +174,138 @@ export class CrossAgentOrchestrator {
       }
     }
 
-    // Build markdown
     let md = `# 📊 Coordinated QA Executive Report\n\n`;
-    md += `## 📋 Run Information\n`;
     md += `- **Date**: ${new Date().toLocaleString()}\n`;
     md += `- **Target Host**: [${this.baseUrl}](${this.baseUrl})\n`;
-    md += `- **Site Map Mapped Pages**: ${visitedPages.length}\n`;
-    md += `- **Broken Link Health Errors**: ${brokenLinks.length === 0 ? '✅ 0 Errors' : `❌ ${brokenLinks.length} Broken Link(s)`}\n`;
-    md += `- **Visual/UX Issues Logged**: ${uiBugs.length === 0 ? '✅ 0 Issues' : `⚠️ ${uiBugs.length} Layout Observation(s)`}\n`;
-    md += `- **Security Audit Logs**: ${securityObservations.length === 0 ? '✅ 0 Vulnerabilities' : `🛡️ ${securityObservations.length} Observation(s)`}\n\n`;
+    md += `- **Pages mapped**: ${visitedPages.length}\n`;
+    md += `- **Distinct defects**: ${distinctTotal} (${p1} P1, ${p2} P2, ${p3} P3) — ${totalInstances} instances total\n`;
+    md += `- **UI/UX**: ${uiGroups.size} distinct (${uiBugs.length} instances)\n`;
+    md += `- **Security**: ${secGroups.size} distinct (${securityFindings.length} instances)\n`;
+    md += `- **Site integrity**: ${brokenLinks.length} broken link(s), ${consoleErrors.length} console error(s)\n\n`;
 
-    md += `## 🌐 Application Navigation Architecture\n`;
-    md += `The Navigation Agent discovered page transitions and mapped the site structure:\n\n`;
+    md += `## 📋 Defect Summary\n\n`;
+    if (distinctTotal === 0) {
+      md += `✅ *No defects logged across the coordinated run.*\n\n`;
+    } else {
+      md += `| Source | ID | Type | Severity | Step | Instances | Where | One-liner |\n`;
+      md += `| --- | --- | --- | --- | --- | --- | --- | --- |\n`;
+      // UI rows
+      for (const bugs of uiGroups.values()) {
+        const primary: any = bugs[0]!;
+        const inst = bugs.length > 1 ? `${bugs.length} ×` : '1';
+        md += `| 🎨 UI | [${primary.id}](#defect-${primary.id.toLowerCase()}) | ${primary.issueType} | ${CrossAgentOrchestrator.severityBadge(primary.severity)} | ${primary.detectedAtStep ?? '-'} | ${inst} | ${CrossAgentOrchestrator.redactUrl(primary.url)} | ${CrossAgentOrchestrator.truncate(primary.description, 100)} |\n`;
+      }
+      // Security rows
+      for (const findings of secGroups.values()) {
+        const primary: any = findings[0]!;
+        const inst = findings.length > 1 ? `${findings.length} ×` : '1';
+        md += `| 🛡️ SEC | [${primary.id}](#defect-${primary.id.toLowerCase()}) | ${primary.type || 'INPUT_VALIDATION'} | ${CrossAgentOrchestrator.severityBadge(primary.severity)} | ${primary.detectedAtStep ?? '-'} | ${inst} | ${CrossAgentOrchestrator.redactUrl(primary.url)} | ${CrossAgentOrchestrator.truncate(primary.description, 100)} |\n`;
+      }
+      // Broken links
+      brokenLinks.forEach((b: any, i: number) => {
+        const id = `BL-${String(i + 1).padStart(3, '0')}`;
+        md += `| 🌐 NAV | ${id} | BROKEN_LINK | 🔴 P1 | - | 1 | ${CrossAgentOrchestrator.redactUrl(b.url)} | ${CrossAgentOrchestrator.truncate(b.error, 100)} |\n`;
+      });
+      // Console errors
+      consoleErrors.forEach((e: any, i: number) => {
+        const id = `CE-${String(i + 1).padStart(3, '0')}`;
+        md += `| 🌐 NAV | ${id} | CONSOLE_ERROR | 🔴 P1 | - | 1 | ${CrossAgentOrchestrator.redactUrl(e.url)} | ${CrossAgentOrchestrator.truncate(e.message, 100)} |\n`;
+      });
+      md += `\n`;
+    }
+
+    md += `## 🌐 Application Navigation Architecture\n\n`;
+    md += `Navigation Agent discovered page transitions during mapping:\n\n`;
     md += `\`\`\`mermaid\n${mermaid}\`\`\`\n\n`;
 
-    md += `## 🐞 UI/UX & Formatting Audit Summary\n`;
-    if (uiBugs.length === 0) {
-      md += `✅ *No visual formatting or responsiveness bugs were logged in this session.*\n\n`;
+    // UI defect cards
+    md += `## 🎨 UI/UX Defects\n\n`;
+    if (uiGroups.size === 0) {
+      md += `✅ *No visual formatting or responsiveness defects logged.*\n\n`;
     } else {
-      md += `| Page | Element Selector | Issue Type | Description |\n`;
-      md += `| --- | --- | --- | --- |\n`;
-      uiBugs.forEach((bug: any) => {
-        md += `| ${bug.url.replace(this.baseUrl, '/')} | \`${bug.elementSelector}\` | **${bug.issueType.toUpperCase()}** | ${bug.description} |\n`;
-      });
-      md += `\n`;
+      for (const bugs of uiGroups.values()) {
+        const primary: any = bugs[0]!;
+        const inst = bugs.length;
+        md += `### <a id="defect-${primary.id.toLowerCase()}"></a>${primary.id} — ${primary.issueType} (${CrossAgentOrchestrator.severityBadge(primary.severity)})`;
+        if (inst > 1) md += ` — ${inst} instances`;
+        md += `\n\n`;
+        md += `**Where**: ${CrossAgentOrchestrator.redactUrl(primary.url)}\n\n`;
+        md += `**Element**: \`${primary.elementSelector}\`\n\n`;
+        md += `**Description**: ${primary.description}\n\n`;
+        if (inst > 1) {
+          md += `**All instances** (grouped by element + page + issue type):\n\n`;
+          md += `| Instance ID | Step | Selector |\n`;
+          md += `| --- | --- | --- |\n`;
+          bugs.forEach((b: any) => {
+            md += `| ${b.id} | ${b.detectedAtStep ?? '-'} | \`${CrossAgentOrchestrator.truncate(b.elementSelector, 80)}\` |\n`;
+          });
+          md += `\n`;
+        }
+      }
     }
 
-    md += `## 🛡️ Input Sanitization & Security Validation Audit\n`;
-    if (securityObservations.length === 0) {
-      md += `✅ *No input validation vulnerabilities or boundary issues were logged during this audit.*\n\n`;
+    // Security defect cards
+    md += `## 🛡️ Security Findings\n\n`;
+    if (secGroups.size === 0) {
+      md += `✅ *No input validation or boundary issues logged.*\n\n`;
     } else {
-      md += `| Page | Field Selector | Severity | Audit Observations |\n`;
-      md += `| --- | --- | --- | --- |\n`;
-      securityObservations.forEach((sec: any) => {
-        md += `| ${sec.url.replace(this.baseUrl, '/')} | \`${sec.elementSelector}\` | **${sec.severity.toUpperCase()}** | ${sec.description} |\n`;
-      });
-      md += `\n`;
+      for (const findings of secGroups.values()) {
+        const primary: any = findings[0]!;
+        const inst = findings.length;
+        md += `### <a id="defect-${primary.id.toLowerCase()}"></a>${primary.id} — ${primary.type || 'INPUT_VALIDATION'} (${CrossAgentOrchestrator.severityBadge(primary.severity)})`;
+        if (inst > 1) md += ` — ${inst} instances`;
+        md += `\n\n`;
+        md += `**Where**: ${CrossAgentOrchestrator.redactUrl(primary.url)}\n\n`;
+        md += `**Element**: \`${primary.elementSelector}\`\n\n`;
+        md += `**Description**: ${primary.description}\n\n`;
+        if (inst > 1) {
+          md += `**All instances**:\n\n`;
+          md += `| Instance ID | Step | Selector |\n`;
+          md += `| --- | --- | --- |\n`;
+          findings.forEach((f: any) => {
+            md += `| ${f.id} | ${f.detectedAtStep ?? '-'} | \`${CrossAgentOrchestrator.truncate(f.elementSelector, 80)}\` |\n`;
+          });
+          md += `\n`;
+        }
+      }
     }
 
-    md += `## 📑 Site Integrity & Health Check\n`;
-    md += `### Broken Links\n`;
-    if (brokenLinks.length === 0) {
-      md += `✅ *Zero broken links encountered.*\n\n`;
+    // Site integrity
+    md += `## 📑 Site Integrity\n\n`;
+    if (brokenLinks.length === 0 && consoleErrors.length === 0) {
+      md += `✅ *No broken links or console errors during navigation mapping.*\n\n`;
     } else {
-      md += `| Target Link | Source Page | Error Details |\n`;
-      md += `| --- | --- | --- |\n`;
-      brokenLinks.forEach((b: any) => {
-        md += `| ${b.url} | ${b.parentUrl.replace(this.baseUrl, '/')} | ${b.error} |\n`;
-      });
-      md += `\n`;
+      if (brokenLinks.length > 0) {
+        md += `### Broken links\n\n`;
+        md += `| Target | Source page | Error |\n`;
+        md += `| --- | --- | --- |\n`;
+        brokenLinks.forEach((b: any) => {
+          md += `| ${CrossAgentOrchestrator.redactUrl(b.url)} | ${b.parentUrl.replace(this.baseUrl, '/')} | ${CrossAgentOrchestrator.truncate(b.error, 200)} |\n`;
+        });
+        md += `\n`;
+      }
+      if (consoleErrors.length > 0) {
+        md += `### Console errors\n\n`;
+        md += `| Page | Message | Timestamp |\n`;
+        md += `| --- | --- | --- |\n`;
+        consoleErrors.forEach((e: any) => {
+          md += `| ${CrossAgentOrchestrator.redactUrl(e.url)} | ${CrossAgentOrchestrator.truncate(e.message, 200)} | ${e.timestamp} |\n`;
+        });
+        md += `\n`;
+      }
     }
 
     fs.writeFileSync(reportPath, md, 'utf-8');
-    console.log(`\n📝 Executive report successfully generated and saved to: ${reportPath}`);
+    console.log(`\n📝 Executive report saved to: ${reportPath}`);
 
     return {
       targetUrl: this.baseUrl,
       totalVisitedPages: visitedPages.length,
       sitemapMermaid: mermaid,
       brokenLinks,
-      consoleErrors: [],
+      consoleErrors,
       uiBugs,
-      securityObservations,
+      securityObservations: securityFindings,
     };
   }
 }

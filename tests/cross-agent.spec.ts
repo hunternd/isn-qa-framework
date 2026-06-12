@@ -2,8 +2,10 @@ import { test, expect } from '@playwright/test';
 import { CrossAgentOrchestrator } from '../src/engine/cross-agent-orchestrator.js';
 
 test('run coordinated cross-agent QA suite', async ({ page }) => {
-  // Set test timeout to 2 minutes because running multiple agents takes time
-  test.setTimeout(120000);
+  // Bumped from 2min to 6min — coordinated suite runs nav (~10 steps) + UI on
+  // up to 5 pages (3 steps each) + security on filtered pages (3 steps each),
+  // each step ~8–12s with LLM context.
+  test.setTimeout(360000);
 
   const baseUrl = 'https://www.independentsponsor.news/';
   console.log('Initializing Cross-Agent Orchestrator...');

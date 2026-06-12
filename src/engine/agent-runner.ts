@@ -113,6 +113,11 @@ export class AgentRunner {
   private currentUrlStreak = 0;
   private previousUrl: string | null = null;
   private rejectedSelectors = new Set<string>();
+  private visitedViewports: Array<{ width: number; height: number }> = [];
+  // Tracks (selector|payload) pairs already typed during the security audit.
+  // Same selector with a DIFFERENT payload is allowed (legitimate boundary
+  // testing); exact repeats are blocked by the runner.
+  private typedPairs: string[] = [];
 
   constructor(page: Page, baseUrl: string) {
     this.page = page;
@@ -230,6 +235,8 @@ export class AgentRunner {
     await navigate(this.page, '/');
     let currentUrl = this.page.url();
     this.visitedUrls.push(currentUrl);
+    // Record the initial viewport so coverage stats reflect what's been seen.
+    this.visitedViewports.push({ width: this.currentViewport.width, height: this.currentViewport.height });
 
     let steps = 0;
     while (steps < maxSteps) {
@@ -247,20 +254,51 @@ export class AgentRunner {
         this.stepScreenshots[steps] = screenshotRes.filePath;
       }
 
+      // Update breadth-first tracking before consulting the LLM so it sees
+      // fresh section coverage and URL-streak data — same pattern as the
+      // content runner.
+      this.updateSectionAndStreak(currentUrl);
+
       // Read page content
       const pageContent = await readPageContent(this.page);
-      
+
       // Decide action
       const stepsRemaining = maxSteps - steps;
       const decision = await agentInstance.decideNextAction(
         this.visitedUrls,
         pageContent,
         this.currentViewport,
-        stepsRemaining
+        stepsRemaining,
+        this.clickedSelectors,
+        Array.from(this.visitedSections),
+        this.visitedViewports,
+        this.currentUrlStreak,
+        this.bugsLogged,
       );
 
       console.log(`Thought: "${decision.thought}"`);
-      console.log(`Action: ${decision.action} | Target: ${decision.target}`);
+      console.log(`Proposed action: ${decision.action} | Target: ${decision.target}`);
+
+      // Loop-breaker: substitute repeat clicks for fresh alternatives.
+      if (decision.action === 'CLICK' && decision.target && this.clickedSelectors.includes(decision.target)) {
+        console.log(`🔁 UI Loop-breaker: LLM proposed repeat selector "${decision.target}".`);
+        this.rejectedSelectors.add(decision.target);
+        const alt = this.findFreshAlternative(pageContent);
+        if (alt) {
+          console.log(`🔁 UI Loop-breaker: substituting fresh selector "${alt.selector}" (text: "${alt.text ?? ''}").`);
+          decision.target = alt.selector;
+        } else if (this.visitedUrls.length > 1) {
+          console.log(`🔁 UI Loop-breaker: no fresh alternatives on this page — falling back to BACK.`);
+          decision.action = 'BACK';
+          decision.target = null;
+        } else {
+          console.log(`🔁 UI Loop-breaker: no fresh alternatives and no history — finishing.`);
+          decision.action = 'FINISH';
+          decision.target = 'Loop-breaker exhausted on UI exploration.';
+        }
+      }
+
+      console.log(`Executed action: ${decision.action} | Target: ${decision.target}`);
 
       const uiElInfo = pageContent.interactiveElements.find(el => el.selector === decision.target);
       this.actionHistory.push({
@@ -280,9 +318,13 @@ export class AgentRunner {
       if (decision.action === 'RESIZE_VIEWPORT' && decision.params) {
         const { width, height } = decision.params;
         this.currentViewport = { width, height };
+        if (!this.visitedViewports.some(v => v.width === width && v.height === height)) {
+          this.visitedViewports.push({ width, height });
+        }
         await this.page.setViewportSize({ width, height });
         await this.page.waitForTimeout(1000);
       } else if (decision.action === 'CLICK' && decision.target) {
+        this.clickedSelectors.push(decision.target);
         const clickRes = await clickElement(this.page, decision.target);
         await this.page.waitForTimeout(1000);
         currentUrl = this.page.url();
@@ -345,6 +387,9 @@ export class AgentRunner {
         this.stepScreenshots[steps] = screenshotRes.filePath;
       }
 
+      // Update breadth-first tracking before consulting the LLM.
+      this.updateSectionAndStreak(currentUrl);
+
       // Read page content
       const pageContent = await readPageContent(this.page);
 
@@ -353,11 +398,66 @@ export class AgentRunner {
       const decision = await agentInstance.decideNextAction(
         this.visitedUrls,
         pageContent,
-        stepsRemaining
+        stepsRemaining,
+        this.clickedSelectors,
+        Array.from(this.visitedSections),
+        this.currentUrlStreak,
+        this.securityFindings,
+        this.typedPairs,
       );
 
       console.log(`Thought: "${decision.thought}"`);
-      console.log(`Action: ${decision.action} | Target: ${decision.target}`);
+      console.log(`Proposed action: ${decision.action} | Target: ${decision.target}`);
+
+      // Loop-breaker on exact-repeat TYPE. Same selector with a DIFFERENT
+      // payload is allowed (boundary testing); same selector + same payload
+      // is wasted effort that previously caused the agent to dwell on a
+      // single Outseta input for half the run.
+      if (decision.action === 'TYPE' && decision.target && decision.params?.text) {
+        const pairKey = `${decision.target}|${decision.params.text}`;
+        if (this.typedPairs.includes(pairKey)) {
+          console.log(`🔁 Security Loop-breaker: LLM proposed repeat TYPE pair "${pairKey}".`);
+          const alt = this.findFreshAlternative(pageContent);
+          if (alt) {
+            console.log(`🔁 Security Loop-breaker: switching to fresh CLICK target "${alt.selector}".`);
+            decision.action = 'CLICK';
+            decision.target = alt.selector;
+            decision.params = {};
+          } else if (this.visitedUrls.length > 1) {
+            console.log(`🔁 Security Loop-breaker: no fresh alternatives — falling back to BACK.`);
+            decision.action = 'BACK';
+            decision.target = null;
+            decision.params = {};
+          } else {
+            console.log(`🔁 Security Loop-breaker: no fresh alternatives and no history — finishing.`);
+            decision.action = 'FINISH';
+            decision.target = 'Loop-breaker exhausted on security audit.';
+            decision.params = {};
+          }
+        }
+      }
+
+      // Loop-breaker on repeat clicks (same as UI/Content runners). We don't
+      // intercept the TYPE-then-different-payload case — that's handled above.
+      if (decision.action === 'CLICK' && decision.target && this.clickedSelectors.includes(decision.target)) {
+        console.log(`🔁 Security Loop-breaker: LLM proposed repeat selector "${decision.target}".`);
+        this.rejectedSelectors.add(decision.target);
+        const alt = this.findFreshAlternative(pageContent);
+        if (alt) {
+          console.log(`🔁 Security Loop-breaker: substituting fresh selector "${alt.selector}" (text: "${alt.text ?? ''}").`);
+          decision.target = alt.selector;
+        } else if (this.visitedUrls.length > 1) {
+          console.log(`🔁 Security Loop-breaker: no fresh alternatives — falling back to BACK.`);
+          decision.action = 'BACK';
+          decision.target = null;
+        } else {
+          console.log(`🔁 Security Loop-breaker: no fresh alternatives and no history — finishing.`);
+          decision.action = 'FINISH';
+          decision.target = 'Loop-breaker exhausted on security audit.';
+        }
+      }
+
+      console.log(`Executed action: ${decision.action} | Target: ${decision.target}`);
 
       const secElInfo = pageContent.interactiveElements.find(el => el.selector === decision.target);
       this.actionHistory.push({
@@ -376,12 +476,14 @@ export class AgentRunner {
 
       if (decision.action === 'TYPE' && decision.target && decision.params) {
         const { text } = decision.params;
+        this.typedPairs.push(`${decision.target}|${text}`);
         const typeRes = await typeText(this.page, decision.target, text);
         if (!typeRes.success) {
           this.actionHistory[this.actionHistory.length - 1]!.result = 'failed';
           this.actionHistory[this.actionHistory.length - 1]!.error = typeRes.error;
         }
       } else if (decision.action === 'CLICK' && decision.target) {
+        this.clickedSelectors.push(decision.target);
         const clickRes = await clickElement(this.page, decision.target);
         await this.page.waitForTimeout(1000);
         currentUrl = this.page.url();

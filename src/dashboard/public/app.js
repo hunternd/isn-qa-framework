@@ -182,7 +182,7 @@ function renderReportList() {
     card.className = `report-card ${state.activeReport && state.activeReport.filename === report.filename ? 'active' : ''}`;
     card.dataset.filename = report.filename;
     
-    const displayType = report.type === 'ui_ux' ? 'UI/UX' : report.type;
+    const displayType = report.type === 'ui_ux' ? 'UI/UX' : report.type === 'scenario' ? 'Scenario' : report.type;
     const statusText = report.bugsCount > 0 ? `${report.bugsCount} defects` : 'clean';
     const statusClass = report.bugsCount > 0 ? 'defects' : 'clean';
     const cleanSite = report.targetSite.replace(/^https?:\/\/(www\.)?/, '');
@@ -217,6 +217,7 @@ function getReportIcon(type) {
     case 'ui_ux': return '🎨';
     case 'security': return '🛡️';
     case 'navigation': return '🌐';
+    case 'scenario': return '🎯';
     default: return '📄';
   }
 }

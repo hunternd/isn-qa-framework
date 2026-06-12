@@ -4,8 +4,9 @@ import { UIAgent } from '../src/agents/ui-agent.js';
 import { SecurityAgent } from '../src/agents/security-agent.js';
 
 test.describe('Specialized QA Agents Verification', () => {
-  // Set test timeout to 60 seconds because running multiple steps takes time
-  test.setTimeout(60000);
+  // Bumped from 60s to 180s — LLM calls + section/coverage context per step
+  // run ~8–12s; 6 steps + screenshot/loop overhead fits comfortably in 3 min.
+  test.setTimeout(180000);
 
   const baseUrl = 'https://www.independentsponsor.news/';
 
