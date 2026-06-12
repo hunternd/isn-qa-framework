@@ -38,10 +38,12 @@ export class ContentAgent {
     lastAction: { action: string; selector: string | null; text: string | null } | null,
     stepsRemaining: number,
     bugsLogged: any[] = [],
-    clickedSelectors: string[] = []
+    clickedSelectors: string[] = [],
+    visitedSections: string[] = [],
+    urlStreak: number = 0
   ): Promise<ContentAgentDecision> {
     if (this.isMockMode) {
-      return this.decideMockAction(visitedUrls, pageContent, lastAction, bugsLogged, clickedSelectors);
+      return this.decideMockAction(visitedUrls, pageContent, lastAction, bugsLogged, clickedSelectors, visitedSections);
     }
 
     try {
@@ -49,53 +51,75 @@ export class ContentAgent {
         throw new Error('Anthropic client is not initialized.');
       }
 
+      const KNOWN_SECTIONS = ['home', 'newsletters', 'insights', 'news', 'about', 'contact'];
+      const unvisitedSections = KNOWN_SECTIONS.filter(s => !visitedSections.includes(s));
+      const currentSection = (() => {
+        try {
+          const u = new URL(pageContent.url);
+          const segs = u.pathname.split('/').filter(s => s.length > 0);
+          return segs.length === 0 ? 'home' : segs[0]!;
+        } catch {
+          return 'unknown';
+        }
+      })();
+
       const response = await this.anthropic.messages.create({
         model: this.model,
         max_tokens: 1000,
-        system: `You are the "Authenticated Content Agent" in an agentic QA framework. Your goal is to systematically verify that links, buttons, and embedded components on "https://www.independentsponsor.news/" render correct semantic content and function properly.
+        system: `You are a QA subscriber exploring https://www.independentsponsor.news/ to uncover defects that real users will eventually hit. Your job is BREADTH-FIRST EXPLORATION — touch many different surfaces rather than deeply auditing one.
 
-Your capabilities include:
-1. click: Click an article link, navigation link, or interactive button.
-2. logContentBug: Report a mismatch or defect (e.g., broken links, invalid SoundCloud player embeds, or inactive buttons).
-3. goBack: Return to the previous page in history to verify other links.
-4. finish: Complete your content audit.
+Coverage targets for this audit:
+- Visit at least 2 different sections (e.g. newsletters, insights, about, contact) before finishing.
+- Click at least 3 distinct article/newsletter links across those sections.
+- After auditing 1-2 items in a section, MOVE TO A DIFFERENT SECTION rather than dwelling.
 
-Rules for Systematic Auditing:
-- Do NOT stop after logging your first bug. Continue auditing other links on the site.
-- If you log a bug for a page, immediately go back to the index page or navigate to another section to check other elements.
-- Look out for:
-  1. SoundCloud Audio Player errors: Check if there is an error message stating "You have not provided a valid SoundCloud URL" or similar layout failures.
-  2. Dead Action buttons (e.g. "Submit News"): If clicking a button doesn't change the URL, open a form/modal, or update the page content, it is inactive.
-  3. Mismatched Topics: If a link promises one article topic/date but renders another.
-- Refer to the list of already logged bugs so you do not log the exact same bug twice.
+Hard constraints (the runner will override you if you violate these):
+- NEVER pick a selector that already appears in "Already clicked selectors". The runner will substitute a different one and log a loop-breaker warning.
+- If your current URL has not changed for 2+ steps (urlStreak >= 1), STOP repeating the same click. Pick a link to a DIFFERENT section, or use goBack.
+- Avoid selectors whose class names suggest hidden nav dropdowns (e.g. classes containing "dropdown" or "nav-menu"). Prefer the direct link in the page body.
 
-User Journey Rules:
-- If you encounter an "Access Denied" page:
-  1. Act like a normal user: look for the "Log In" link/button (often a link containing Outseta login trigger) and click it.
-  2. The runner will handle inputting the credentials. Once logged in, go back/navigate and click the SAME article link again.
-  3. If it opens successfully, navigate back to newsletters list and click a DIFFERENT newsletter.
-  4. If that second newsletter (or any subsequent page) triggers an "Access Denied" message, log it immediately as a DEFECT using logContentBug (specifying in the description that the user was already logged in when denied).
-- If the current page content does not match the link that was clicked (excluding expected authentication gates), log a bug immediately.
-- Pay close attention to dates (e.g., year mismatches), titles, topics, and empty/broken content segments.`,
+What to look for (be opportunistic, not exhaustive):
+- Content that contradicts the link you clicked — wrong date, wrong topic, blank or error-stating page.
+- Hrefs that look malformed (spaces, two URLs concatenated, unresolved placeholders like SUBSCRIBER_ID or USER_ID).
+- Buttons or CTAs that visibly do nothing when clicked.
+- New tabs opening to 404s, error pages, or URLs with template placeholders.
+- Embedded players or widgets showing error messages.
+- Visible "Access Denied" pages when you were already logged in. (The framework's sentinel catches silent session drops automatically — you only need to flag VISIBLE access-denied while authenticated.)
+
+Use logContentBug for any of the above. Don't bother re-logging duplicates — that list is provided.
+
+When the audit feels covered (2+ sections, 3+ articles, key surfaces checked, or only 1-2 steps remain), use finish with a summary of what you found and what you skipped.`,
         messages: [
           {
             role: 'user',
             content: `Current page URL: ${pageContent.url}
+Current section: ${currentSection}
 Page Title: ${pageContent.title}
 Last action taken: ${lastAction ? `${lastAction.action} on "${lastAction.selector}" (Text: "${lastAction.text || 'None'}")` : 'None (Starting Page)'}
-Steps remaining in this content audit: ${stepsRemaining}
-Visited pages: ${JSON.stringify(visitedUrls, null, 2)}
-Already clicked elements/selectors in this session: ${JSON.stringify(clickedSelectors, null, 2)}
-Already logged content defects in this session: ${JSON.stringify(bugsLogged, null, 2)}
+Steps remaining: ${stepsRemaining}
+URL streak: ${urlStreak} (number of consecutive prior steps that ended at the SAME URL — if >= 1, your last click did not navigate you anywhere; pick something different)
 
-Interactive Elements on this page:
+Coverage so far:
+- Sections visited: ${JSON.stringify(visitedSections)}
+- Likely-unvisited sections to consider next: ${JSON.stringify(unvisitedSections)}
+- Distinct selectors clicked: ${clickedSelectors.length}
+
+Visited URLs (sampled): ${JSON.stringify(visitedUrls.slice(-10), null, 2)}
+
+Already clicked selectors (DO NOT re-pick; runner will reject):
+${JSON.stringify(clickedSelectors, null, 2)}
+
+Already logged content defects (do not re-log):
+${JSON.stringify(bugsLogged.map((b: any) => ({ id: b.id, type: b.type, linkText: b.linkText, url: b.url })), null, 2)}
+
+Interactive elements on this page (pick from these for click, or use goBack/finish):
 ${JSON.stringify(pageContent.interactiveElements.map(el => ({
   tag: el.tagName,
   text: el.text,
   selector: el.selector,
 })), null, 2)}
 
-Inspect the current page or select a link to click next. If the page content contradicts what the last clicked link promised, or is broken/inactive, log a content bug.`
+Pick the next action. Strongly prefer elements that take you to an UNVISITED section. If nothing useful remains on this page, use goBack.`
           }
         ],
         tools: [
@@ -179,7 +203,7 @@ Inspect the current page or select a link to click next. If the page content con
 
     } catch (err: any) {
       console.error('LLM Content Agent API error, falling back to local crawler logic:', err.message || err);
-      return this.decideMockAction(visitedUrls, pageContent, lastAction, bugsLogged, clickedSelectors);
+      return this.decideMockAction(visitedUrls, pageContent, lastAction, bugsLogged, clickedSelectors, visitedSections);
     }
   }
 
@@ -188,7 +212,8 @@ Inspect the current page or select a link to click next. If the page content con
     pageContent: PageContent,
     lastAction: { action: string; selector: string | null; text: string | null } | null,
     bugsLogged: any[] = [],
-    clickedSelectors: string[] = []
+    clickedSelectors: string[] = [],
+    visitedSections: string[] = []
   ): ContentAgentDecision {
     // 1. If we just logged a bug, go back to look for other links
     if (lastAction && lastAction.action === 'LOG_CONTENT_BUG') {
@@ -243,46 +268,56 @@ Inspect the current page or select a link to click next. If the page content con
       }
     }
 
-    // 3. Otherwise, look for an article/newsletter/insight link to audit
-    const unvisitedLinks = pageContent.interactiveElements.filter(el => {
-      if (el.tagName !== 'a') return false;
-      if (clickedSelectors.includes(el.selector)) return false; // Skip if already clicked!
-      
-      const text = (el.text || '').toLowerCase();
-      const href = el.selector.match(/href="([^"]+)"/)?.[1] || '';
-      
-      const isAuditable = text.includes('newsletter') || text.includes('insight') || text.includes('read') || text.includes('submit');
-      if (!isAuditable) return false;
-      
+    // 3. Otherwise, rank fresh links by section diversity. Pick the highest-scoring
+    // link not yet clicked, preferring links into sections we have NOT visited yet.
+    const sectionFromHref = (href: string): string => {
       try {
-        const absUrl = new URL(href, pageContent.url).toString();
-        return !visitedUrls.includes(absUrl);
-      } catch (e) {
-        return false;
+        const u = new URL(href, pageContent.url);
+        const segs = u.pathname.split('/').filter(s => s.length > 0);
+        if (segs.length === 0) return 'home';
+        return segs[0]!;
+      } catch {
+        return 'unknown';
       }
-    });
+    };
 
-    if (unvisitedLinks.length > 0) {
-      const targetLink = unvisitedLinks[0];
-      if (targetLink) {
-        return {
-          thought: `Local mock decision: Click link "${targetLink.text}" to audit its contents.`,
-          action: 'CLICK',
-          target: targetLink.selector,
-          params: {
-            linkText: targetLink.text
-          }
-        };
-      }
+    type Cand = { el: any; href: string; section: string; score: number };
+    const candidates: Cand[] = [];
+    for (const el of pageContent.interactiveElements) {
+      if (el.tagName !== 'a' && el.tagName !== 'button') continue;
+      if (clickedSelectors.includes(el.selector)) continue;
+      const hrefMatch = el.selector.match(/href="([^"]+)"/);
+      const href = hrefMatch?.[1] || '';
+      const section = href ? sectionFromHref(href) : 'unknown';
+
+      // Filter out obvious navigation noise: hidden dropdown items, "skip to content"
+      // etc. would have classes containing dropdown/skip. Selector text proxies for this.
+      if (/dropdown|skip-to/i.test(el.selector)) continue;
+
+      let score = 0;
+      // Big bonus for unvisited section.
+      if (section !== 'external' && section !== 'unknown' && !visitedSections.includes(section)) score += 5;
+      // Modest bonus for likely-article text.
+      const text = (el.text || '').toLowerCase();
+      if (/newsletter|insight|read|subscribe|submit/.test(text)) score += 2;
+      // Prefer anchors with clean hrefs.
+      if (href && !href.startsWith('#') && href !== 'javascript:void(0)') score += 1;
+      // Mild penalty for external links — we want to test the site itself.
+      if (section === 'external') score -= 2;
+
+      candidates.push({ el, href, section, score });
     }
 
-    // Fallback: click News link or go back
-    const newsLink = pageContent.interactiveElements.find(el => (el.text || '').toLowerCase().includes('news'));
-    if (newsLink && pageContent.url === 'https://www.independentsponsor.news/') {
+    candidates.sort((a, b) => b.score - a.score);
+    const pick = candidates[0];
+    if (pick && pick.score > 0) {
       return {
-        thought: 'Local mock decision: Click News link to look for newsletter content.',
+        thought: `Local mock decision: click "${pick.el.text || pick.el.selector}" to enter section "${pick.section}" (score ${pick.score}).`,
         action: 'CLICK',
-        target: newsLink.selector
+        target: pick.el.selector,
+        params: {
+          linkText: pick.el.text
+        }
       };
     }
 

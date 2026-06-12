@@ -1,5 +1,6 @@
 import type { Page } from '@playwright/test';
 import { readPageContent, navigate, clickElement, typeText, takeScreenshot } from '../tools/index.js';
+import type { PageContent, InteractiveElement } from '../tools/navigation.js';
 import { detectAuthState, isLogoutIntent, type AuthSnapshot, type AuthState, type SessionDefect, type SessionDefectAction } from './session.js';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -108,6 +109,10 @@ export class AgentRunner {
   private stepScreenshots: Record<number, string> = {};
   private nextDefectIds = { content: 1, ui: 1, security: 1 };
   private currentStep = 0;
+  private visitedSections = new Set<string>();
+  private currentUrlStreak = 0;
+  private previousUrl: string | null = null;
+  private rejectedSelectors = new Set<string>();
 
   constructor(page: Page, baseUrl: string) {
     this.page = page;
@@ -118,6 +123,71 @@ export class AgentRunner {
     const key = prefix === 'CB' ? 'content' : prefix === 'UB' ? 'ui' : 'security';
     const n = this.nextDefectIds[key]++;
     return `${prefix}-${String(n).padStart(3, '0')}`;
+  }
+
+  // Section = first path segment after the base host. Used to drive breadth-first
+  // exploration: agents should bounce between sections rather than dwell in one.
+  private sectionOf(url: string): string {
+    try {
+      const u = new URL(url);
+      const base = new URL(this.baseUrl);
+      if (u.host !== base.host) return 'external';
+      const segs = u.pathname.split('/').filter(s => s.length > 0);
+      if (segs.length === 0) return 'home';
+      return segs[0]!;
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  private sectionOfHref(href: string, currentUrl: string): string {
+    try {
+      return this.sectionOf(new URL(href, currentUrl).toString());
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  // Pick a runner-driven alternative when the LLM proposes a click on something
+  // that's already been clicked or that the loop-breaker just rejected. Prefers
+  // links into sections we haven't visited yet.
+  private findFreshAlternative(pageContent: PageContent): { selector: string; text: string | null } | null {
+    const fresh: InteractiveElement[] = pageContent.interactiveElements.filter((el: InteractiveElement) => {
+      if (!el.selector) return false;
+      if (this.clickedSelectors.includes(el.selector)) return false;
+      if (this.rejectedSelectors.has(el.selector)) return false;
+      // Anchors and buttons only — skip raw inputs we don't know how to use.
+      if (el.tagName !== 'a' && el.tagName !== 'button') return false;
+      return true;
+    });
+    if (fresh.length === 0) return null;
+
+    const score = (el: InteractiveElement): number => {
+      let s = 0;
+      const hrefMatch = el.selector.match(/href="([^"]+)"/);
+      if (hrefMatch && hrefMatch[1]) {
+        const target = this.sectionOfHref(hrefMatch[1], pageContent.url);
+        if (target !== 'external' && !this.visitedSections.has(target)) s += 3;
+        if (target === 'external') s -= 1;
+      }
+      // Slight preference for anchors over buttons (typically navigation).
+      if (el.tagName === 'a') s += 1;
+      return s;
+    };
+
+    fresh.sort((a: InteractiveElement, b: InteractiveElement) => score(b) - score(a));
+    const pick = fresh[0]!;
+    return { selector: pick.selector, text: pick.text ?? null };
+  }
+
+  private updateSectionAndStreak(currentUrl: string): void {
+    this.visitedSections.add(this.sectionOf(currentUrl));
+    if (this.previousUrl !== null && this.previousUrl === currentUrl) {
+      this.currentUrlStreak += 1;
+    } else {
+      this.currentUrlStreak = 0;
+    }
+    this.previousUrl = currentUrl;
   }
 
   private buildReproductionTrail(currentStep: number, currentUrl: string, depth = 6): ReproStep[] {
@@ -642,6 +712,10 @@ export class AgentRunner {
         }
       }
 
+      // Update breadth-first tracking before consulting the LLM so it sees fresh
+      // section coverage and URL-streak data.
+      this.updateSectionAndStreak(currentUrl);
+
       // Consult LLM
       const stepsRemaining = maxSteps - steps;
       const decision: any = await agentInstance.decideNextAction(
@@ -650,11 +724,38 @@ export class AgentRunner {
         lastAction,
         stepsRemaining,
         this.contentBugsLogged,
-        this.clickedSelectors
+        this.clickedSelectors,
+        Array.from(this.visitedSections),
+        this.currentUrlStreak
       );
 
       console.log(`Thought: "${decision.thought}"`);
-      console.log(`Action: ${decision.action} | Target: ${decision.target}`);
+      console.log(`Proposed action: ${decision.action} | Target: ${decision.target}`);
+
+      // Loop-breaker: if the LLM proposes clicking something it (or an earlier
+      // step) already clicked, substitute a fresh alternative — preferring links
+      // into sections we haven't visited yet. Falls back to BACK when nothing
+      // fresh is available.
+      if (decision.action === 'CLICK' && decision.target && this.clickedSelectors.includes(decision.target)) {
+        console.log(`🔁 Loop-breaker: LLM proposed repeat selector "${decision.target}".`);
+        this.rejectedSelectors.add(decision.target);
+        const alt = this.findFreshAlternative(pageContent);
+        if (alt) {
+          console.log(`🔁 Loop-breaker: substituting fresh selector "${alt.selector}" (text: "${alt.text ?? ''}").`);
+          decision.target = alt.selector;
+          decision.params = { ...(decision.params ?? {}), linkText: alt.text };
+        } else if (this.visitedUrls.length > 1) {
+          console.log(`🔁 Loop-breaker: no fresh alternatives on this page — falling back to BACK.`);
+          decision.action = 'BACK';
+          decision.target = null;
+        } else {
+          console.log(`🔁 Loop-breaker: no fresh alternatives and no history — finishing.`);
+          decision.action = 'FINISH';
+          decision.target = 'Loop-breaker exhausted; nothing else to audit.';
+        }
+      }
+
+      console.log(`Executed action: ${decision.action} | Target: ${decision.target}`);
 
       const contentElInfo = pageContent.interactiveElements.find(el => el.selector === decision.target);
       this.actionHistory.push({
