@@ -149,6 +149,91 @@ export class ScenarioRunner {
         return this.pass(stepNumber, 'clickSelector', `Click selector "${step.clickSelector}" → ${this.page.url()}`, screenshot);
       }
 
+      if ('clickDirect' in step) {
+        // Invoke .click() on the matched element directly via page.evaluate.
+        // For anchors, this triggers navigation as if the user clicked.
+        const urlBefore = this.page.url();
+        const found = await this.page.evaluate((sel) => {
+          const el = document.querySelector(sel) as HTMLElement | null;
+          if (!el) return { ok: false, reason: 'no element' };
+          el.click();
+          return { ok: true, reason: '' };
+        }, step.clickDirect);
+        await this.page.waitForTimeout(1500);
+        const screenshot = await this.snap(scenarioId, stepNumber, `clickDirect`);
+        if (!found.ok) {
+          return this.fail(stepNumber, 'clickDirect', `Direct click on "${step.clickDirect}"`, `Element not found: ${found.reason}`, screenshot);
+        }
+        return this.pass(
+          stepNumber,
+          'clickDirect',
+          `Direct click on "${step.clickDirect}" (${urlBefore} → ${this.page.url()})`,
+          screenshot,
+        );
+      }
+
+      if ('hoverThenClick' in step) {
+        const { hover, click } = step.hoverThenClick;
+        try {
+          // Raw mouse path. The flow:
+          //   1. Move cursor to the hover target's center (opens Webflow
+          //      dropdown via CSS :hover).
+          //   2. Wait briefly for the open animation.
+          //   3. Re-resolve the click target's bbox AFTER the dropdown is
+          //      open — before hover it has 0×0 layout, so locator.click()
+          //      can't find a clickable area.
+          //   4. Move smoothly to the new bbox (steps: 5) so the cursor stays
+          //      within the dropdown wrapper and :hover doesn't drop.
+          //   5. Click via mouse.down + mouse.up at the final coords.
+          const hoverSel = hover.includes(':visible') ? hover : `${hover}:visible`;
+          const hoverBox = await this.page.locator(hoverSel).first().boundingBox();
+          if (!hoverBox) throw new Error(`Hover target "${hover}" has no bounding box.`);
+          await this.page.mouse.move(hoverBox.x + hoverBox.width / 2, hoverBox.y + hoverBox.height / 2);
+          await this.page.waitForTimeout(400);
+          const clickBox = await this.page.locator(click).first().boundingBox();
+          if (!clickBox || clickBox.width === 0 || clickBox.height === 0) {
+            throw new Error(`Click target "${click}" still has zero layout after hover — dropdown did not open.`);
+          }
+          await this.page.mouse.move(clickBox.x + clickBox.width / 2, clickBox.y + clickBox.height / 2, { steps: 5 });
+          await this.page.mouse.down();
+          await this.page.mouse.up();
+          await this.page.waitForTimeout(1800);
+        } catch (err: any) {
+          const screenshot = await this.snap(scenarioId, stepNumber, 'hoverThenClick_FAILED');
+          return this.fail(
+            stepNumber,
+            'hoverThenClick',
+            `Hover "${hover}" then click "${click}"`,
+            err.message || String(err),
+            screenshot,
+          );
+        }
+        const screenshot = await this.snap(scenarioId, stepNumber, 'hoverThenClick');
+        return this.pass(
+          stepNumber,
+          'hoverThenClick',
+          `Hover "${hover}" then click "${click}" → ${this.page.url()}`,
+          screenshot,
+        );
+      }
+
+      if ('hoverSelector' in step) {
+        try {
+          // Prefer the visible variant so we don't try to hover an off-screen
+          // duplicate (same trick the click tool uses).
+          const sel = step.hoverSelector.includes(':visible') ? step.hoverSelector : `${step.hoverSelector}:visible`;
+          await this.page.locator(sel).first().hover({ timeout: 5000 });
+          // Give the dropdown animation time to expand and its child links to
+          // become visible to subsequent click steps.
+          await this.page.waitForTimeout(700);
+        } catch (err: any) {
+          const screenshot = await this.snap(scenarioId, stepNumber, 'hoverSelector_FAILED');
+          return this.fail(stepNumber, 'hoverSelector', `Hover selector "${step.hoverSelector}"`, err.message || String(err), screenshot);
+        }
+        const screenshot = await this.snap(scenarioId, stepNumber, 'hoverSelector');
+        return this.pass(stepNumber, 'hoverSelector', `Hover selector "${step.hoverSelector}"`, screenshot);
+      }
+
       if ('back' in step) {
         try {
           await this.page.goBack();
