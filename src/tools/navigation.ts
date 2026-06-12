@@ -60,43 +60,85 @@ export async function readPageContent(page: Page): Promise<PageContent> {
   const interactiveElements = await page.evaluate(() => {
     const elements: InteractiveElement[] = [];
 
-    // Helper to generate a unique selector or at least a highly specific one
+    function escapeAttr(s: string): string {
+      return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    }
+
+    function isStableId(id: string): boolean {
+      if (id.length > 50) return false;
+      // Hex-like IDs (uuids, hashes) are auto-generated and change across runs.
+      if (/^[a-f0-9]{16,}$/i.test(id)) return false;
+      return true;
+    }
+
+    function isCleanHref(href: string | null): boolean {
+      if (!href) return false;
+      if (href === '#' || href === '') return false;
+      if (href.startsWith('javascript:')) return false;
+      // Malformed (multi-value) hrefs like "https://x.com news@x.com".
+      if (href.includes(' ')) return false;
+      // Query strings carry UTM and per-render tokens that break stability.
+      if (href.includes('?')) return false;
+      // Template placeholders e.g. SUBSCRIBER_ID, USER_ID, ACCESS_TOKEN.
+      if (/\b[A-Z][A-Z_]{3,}\b/.test(href)) return false;
+      if (href.length > 80) return false;
+      return true;
+    }
+
+    // Helper to generate a stable, short, locator-friendly selector.
+    // Priority: data-testid → stable id → name → aria-label → clean href → text → class fallback.
     function getSelector(el: Element): string {
-      if (el.id) {
+      const tag = el.tagName.toLowerCase();
+
+      const testId = el.getAttribute('data-testid');
+      if (testId) {
+        return `[data-testid="${escapeAttr(testId)}"]`;
+      }
+
+      if (el.id && isStableId(el.id)) {
         if (/^[0-9]/.test(el.id)) {
-          return `[id="${el.id}"]`;
+          return `[id="${escapeAttr(el.id)}"]`;
         }
         return `#${el.id}`;
       }
-      if (el.getAttribute('name')) {
-        return `${el.tagName.toLowerCase()}[name="${el.getAttribute('name')}"]`;
+
+      const name = el.getAttribute('name');
+      if (name) {
+        return `${tag}[name="${escapeAttr(name)}"]`;
       }
-      if (el.tagName.toLowerCase() === 'a') {
+
+      const ariaLabel = el.getAttribute('aria-label');
+      if (ariaLabel) {
+        return `${tag}[aria-label="${escapeAttr(ariaLabel)}"]`;
+      }
+
+      if (tag === 'a') {
         const href = el.getAttribute('href');
-        if (href && href !== '#' && !href.startsWith('javascript:')) {
+        if (isCleanHref(href)) {
           return `a[href="${href}"]`;
         }
       }
-      
-      let selector = el.tagName.toLowerCase();
-      
-      const ariaLabel = el.getAttribute('aria-label');
-      if (ariaLabel) {
-        return `${selector}[aria-label="${ariaLabel}"]`;
-      }
-      
-      const role = el.getAttribute('role');
-      if (role) {
-        selector += `[role="${role}"]`;
+
+      // Text-based fallback — works for nav links, buttons, "here" links inside templated
+      // newsletter footers, and any anchor whose href was UTM-laden or placeholder-laden.
+      const rawText = (el.textContent || '').trim().replace(/\s+/g, ' ');
+      if (rawText) {
+        const snippet = rawText.length > 40 ? rawText.slice(0, 40) : rawText;
+        return `${tag}:has-text("${escapeAttr(snippet)}")`;
       }
 
+      // Final fallback: tag + role + first class.
+      let selector = tag;
+      const role = el.getAttribute('role');
+      if (role) {
+        selector += `[role="${escapeAttr(role)}"]`;
+      }
       if (el.className && typeof el.className === 'string') {
         const cleanClasses = el.className.trim().split(/\s+/).filter(c => c && !c.includes(':') && !c.includes('{'));
         if (cleanClasses.length > 0 && cleanClasses[0]) {
           selector += `.${cleanClasses[0]}`;
         }
       }
-
       return selector;
     }
 

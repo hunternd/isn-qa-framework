@@ -1,9 +1,63 @@
 import type { Page } from '@playwright/test';
 import { readPageContent, navigate, clickElement, typeText, takeScreenshot } from '../tools/index.js';
+import { detectAuthState, isLogoutIntent, type AuthSnapshot, type AuthState, type SessionDefect, type SessionDefectAction } from './session.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
-export interface AuditBug {
+// Tokens that strongly suggest a click is supposed to do something user-visible.
+// We only run dead-click detection when one of these applies, to avoid false-positives
+// on toggles, dropdowns, accordions, and other clicks that legitimately do nothing
+// observable in URL/text terms.
+const ACTION_TEXT_REGEX = /\b(submit|send|save|register|sign\s?up|sign\s?in|log\s?in|login|subscribe|unsubscribe|apply|continue|confirm|book|order|buy|add to cart|checkout|download|upload|share|print|create|delete|update|publish|join|get started|try free|start free trial|enroll|request|contact)\b/;
+
+function isActionLikeElement(elInfo: { tagName?: string | undefined; type?: string | undefined; text?: string | null | undefined } | undefined): boolean {
+  if (!elInfo) return false;
+  const tag = (elInfo.tagName || '').toLowerCase();
+  const type = (elInfo.type || '').toLowerCase();
+  if (tag === 'button') return true;
+  if (tag === 'input' && (type === 'submit' || type === 'button')) return true;
+  const text = (elInfo.text || '').trim().toLowerCase();
+  if (!text) return false;
+  return ACTION_TEXT_REGEX.test(text);
+}
+
+function hashString(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  }
+  return h;
+}
+
+interface ClickSnapshot {
+  url: string;
+  textHash: number;
+  textLength: number;
+  dialogCount: number;
+  pageCount: number;
+  contentBugCount: number;
+}
+
+export type DefectSeverity = 'low' | 'medium' | 'high';
+
+export interface ReproStep {
+  step: number;
+  action: string;
+  target: string | null;
+  url: string;
+  linkText?: string | null | undefined;
+}
+
+export interface DefectMeta {
+  id: string;
+  type: string;
+  severity: DefectSeverity;
+  detectedAtStep: number;
+  reproduction: ReproStep[];
+  evidenceScreenshot?: string | undefined;
+}
+
+export interface AuditBug extends DefectMeta {
   elementSelector: string;
   issueType: string;
   description: string;
@@ -11,15 +65,14 @@ export interface AuditBug {
   timestamp: string;
 }
 
-export interface SecurityFinding {
+export interface SecurityFinding extends DefectMeta {
   elementSelector: string;
-  severity: 'low' | 'medium' | 'high';
   description: string;
   url: string;
   timestamp: string;
 }
 
-export interface ContentBug {
+export interface ContentBug extends DefectMeta {
   linkText: string;
   expectedTopic: string;
   actualTopic: string;
@@ -32,17 +85,74 @@ export class AgentRunner {
   private page: Page;
   private baseUrl: string;
   private visitedUrls: string[] = [];
-  private actionHistory: Array<{ step: number; action: string; target: string | null; result: string; error?: string | undefined }> = [];
+  private actionHistory: Array<{
+    step: number;
+    action: string;
+    target: string | null;
+    result: string;
+    error?: string | undefined;
+    url?: string | undefined;
+    linkText?: string | null | undefined;
+  }> = [];
   private screenshots: Record<string, string> = {};
   private bugsLogged: AuditBug[] = [];
   private securityFindings: SecurityFinding[] = [];
   private contentBugsLogged: ContentBug[] = [];
   private clickedSelectors: string[] = [];
   private currentViewport = { width: 1280, height: 800 };
+  private sessionDefects: SessionDefect[] = [];
+  private baselineAuthSnapshot: AuthSnapshot | null = null;
+  private expectedAuthState: AuthState = 'unknown';
+  private logoutAcknowledged = false;
+  private authHistory: Array<{ step: number; snapshot: AuthSnapshot }> = [];
+  private stepScreenshots: Record<number, string> = {};
+  private nextDefectIds = { content: 1, ui: 1, security: 1 };
+  private currentStep = 0;
 
   constructor(page: Page, baseUrl: string) {
     this.page = page;
     this.baseUrl = baseUrl;
+  }
+
+  private mintDefectId(prefix: 'CB' | 'UB' | 'SF'): string {
+    const key = prefix === 'CB' ? 'content' : prefix === 'UB' ? 'ui' : 'security';
+    const n = this.nextDefectIds[key]++;
+    return `${prefix}-${String(n).padStart(3, '0')}`;
+  }
+
+  private buildReproductionTrail(currentStep: number, currentUrl: string, depth = 6): ReproStep[] {
+    const recent = this.actionHistory.slice(-depth);
+    return recent.map(h => ({
+      step: h.step,
+      action: h.action,
+      target: h.target,
+      url: h.url ?? currentUrl,
+      linkText: h.linkText ?? null,
+    }));
+  }
+
+  private async captureClickSnapshot(): Promise<ClickSnapshot> {
+    const url = this.page.url();
+    const bodyText = await this.page.locator('body').innerText().catch(() => '');
+    const dialogCount = await this.page
+      .locator('[role="dialog"]:visible, [aria-modal="true"]:visible, dialog[open]')
+      .count()
+      .catch(() => 0);
+    const pageCount = this.page.context().pages().length;
+    return {
+      url,
+      textHash: hashString(bodyText),
+      textLength: bodyText.length,
+      dialogCount,
+      pageCount,
+      contentBugCount: this.contentBugsLogged.length,
+    };
+  }
+
+  private static firstLine(text: string | undefined): string {
+    if (!text) return '';
+    const line = text.split(/\r?\n/).find(l => l.trim().length > 0) ?? '';
+    return line.length > 200 ? line.slice(0, 200) + '…' : line;
   }
 
   async runUIAgent(agentInstance: any, maxSteps = 10): Promise<void> {
@@ -54,6 +164,7 @@ export class AgentRunner {
     let steps = 0;
     while (steps < maxSteps) {
       steps++;
+      this.currentStep = steps;
       console.log(`\n--- UI Agent Step ${steps}/${maxSteps} ---`);
       console.log(`URL: ${currentUrl} | Viewport: ${this.currentViewport.width}x${this.currentViewport.height}`);
 
@@ -63,6 +174,7 @@ export class AgentRunner {
       const screenshotRes = await takeScreenshot(this.page, screenshotName);
       if (screenshotRes.success && screenshotRes.filePath) {
         this.screenshots[`${currentUrl}_${this.currentViewport.width}x${this.currentViewport.height}`] = screenshotRes.filePath;
+        this.stepScreenshots[steps] = screenshotRes.filePath;
       }
 
       // Read page content
@@ -80,11 +192,14 @@ export class AgentRunner {
       console.log(`Thought: "${decision.thought}"`);
       console.log(`Action: ${decision.action} | Target: ${decision.target}`);
 
+      const uiElInfo = pageContent.interactiveElements.find(el => el.selector === decision.target);
       this.actionHistory.push({
         step: steps,
         action: decision.action,
         target: decision.target,
-        result: 'success'
+        result: 'success',
+        url: currentUrl,
+        linkText: uiElInfo?.text ?? null,
       });
 
       if (decision.action === 'FINISH') {
@@ -109,7 +224,14 @@ export class AgentRunner {
         }
       } else if (decision.action === 'LOG_BUG' && decision.params) {
         const { issueType, description } = decision.params;
+        const severity: DefectSeverity = /critical|broken/i.test(issueType) ? 'high' : /minor|spacing|cosmetic/i.test(issueType) ? 'low' : 'medium';
         this.bugsLogged.push({
+          id: this.mintDefectId('UB'),
+          type: issueType,
+          severity,
+          detectedAtStep: steps,
+          reproduction: this.buildReproductionTrail(steps, currentUrl),
+          evidenceScreenshot: this.stepScreenshots[steps],
           elementSelector: decision.target || 'N/A',
           issueType,
           description,
@@ -140,6 +262,7 @@ export class AgentRunner {
     let steps = 0;
     while (steps < maxSteps) {
       steps++;
+      this.currentStep = steps;
       console.log(`\n--- Security Agent Step ${steps}/${maxSteps} ---`);
       console.log(`URL: ${currentUrl}`);
 
@@ -149,6 +272,7 @@ export class AgentRunner {
       const screenshotRes = await takeScreenshot(this.page, screenshotName);
       if (screenshotRes.success && screenshotRes.filePath) {
         this.screenshots[currentUrl] = screenshotRes.filePath;
+        this.stepScreenshots[steps] = screenshotRes.filePath;
       }
 
       // Read page content
@@ -165,11 +289,14 @@ export class AgentRunner {
       console.log(`Thought: "${decision.thought}"`);
       console.log(`Action: ${decision.action} | Target: ${decision.target}`);
 
+      const secElInfo = pageContent.interactiveElements.find(el => el.selector === decision.target);
       this.actionHistory.push({
         step: steps,
         action: decision.action,
         target: decision.target,
-        result: 'success'
+        result: 'success',
+        url: currentUrl,
+        linkText: secElInfo?.text ?? null,
       });
 
       if (decision.action === 'FINISH') {
@@ -197,8 +324,13 @@ export class AgentRunner {
       } else if (decision.action === 'LOG_SECURITY' && decision.params) {
         const { severity, description } = decision.params;
         this.securityFindings.push({
-          elementSelector: decision.target || 'N/A',
+          id: this.mintDefectId('SF'),
+          type: 'INPUT_VALIDATION',
           severity,
+          detectedAtStep: steps,
+          reproduction: this.buildReproductionTrail(steps, currentUrl),
+          evidenceScreenshot: this.stepScreenshots[steps],
+          elementSelector: decision.target || 'N/A',
           description,
           url: currentUrl,
           timestamp: new Date().toISOString()
@@ -227,21 +359,42 @@ export class AgentRunner {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const reportPath = path.join(reportDir, `ui_ux_report_${timestamp}.md`);
 
+    const highCount = this.bugsLogged.filter(b => b.severity === 'high').length;
+    const medCount = this.bugsLogged.filter(b => b.severity === 'medium').length;
+    const lowCount = this.bugsLogged.filter(b => b.severity === 'low').length;
+
     let md = `# UI/UX & Formatting Audit Report\n\n`;
     md += `- **Date**: ${new Date().toLocaleString()}\n`;
     md += `- **Target Site**: ${this.baseUrl}\n`;
-    md += `- **Bugs/Observations Logged**: ${this.bugsLogged.length}\n\n`;
+    md += `- **Total defects**: ${this.bugsLogged.length} (${highCount} P1, ${medCount} P2, ${lowCount} P3)\n\n`;
 
-    md += `## 🐞 Visual & Responsive Bugs Logged\n\n`;
+    md += `## 📋 Defect Summary\n\n`;
     if (this.bugsLogged.length === 0) {
       md += `✅ *No visual formatting or alignment bugs logged during this run.*\n\n`;
     } else {
-      md += `| Page URL | Element Selector | Issue Type | Description | Timestamp |\n`;
-      md += `| --- | --- | --- | --- | --- |\n`;
-      this.bugsLogged.forEach(bug => {
-        md += `| ${bug.url} | \`${bug.elementSelector}\` | **${bug.issueType}** | ${bug.description} | ${bug.timestamp} |\n`;
+      md += `| ID | Type | Severity | Step | Page | One-liner |\n`;
+      md += `| --- | --- | --- | --- | --- | --- |\n`;
+      this.bugsLogged.forEach(b => {
+        md += `| [${b.id}](#defect-${b.id.toLowerCase()}) | ${b.issueType} | ${this.severityBadge(b.severity)} | ${b.detectedAtStep} | ${AgentRunner.redactUrl(b.url)} | ${AgentRunner.truncate(b.description, 120)} |\n`;
       });
       md += `\n`;
+    }
+
+    md += `## 🐞 Defects\n\n`;
+    if (this.bugsLogged.length === 0) {
+      md += `_None._\n\n`;
+    } else {
+      this.bugsLogged.forEach(bug => {
+        md += `### <a id="defect-${bug.id.toLowerCase()}"></a>${bug.id} — ${bug.issueType} (${this.severityBadge(bug.severity)})\n\n`;
+        md += `**Where**: step ${bug.detectedAtStep} on ${AgentRunner.redactUrl(bug.url)}\n\n`;
+        md += `**Element**: \`${bug.elementSelector}\`\n\n`;
+        md += `**Description**: ${bug.description}\n\n`;
+        md += `**Reproduction trail**\n\n`;
+        md += this.renderReproductionTable(bug.reproduction);
+        md += `**Evidence**\n\n`;
+        md += `- Screenshot: ${bug.evidenceScreenshot ? `[view](${bug.evidenceScreenshot})` : '_unavailable_'}\n`;
+        md += `- Timestamp: ${bug.timestamp}\n\n`;
+      });
     }
 
     md += `## 📑 Explored Viewports & Screenshots\n\n`;
@@ -249,19 +402,17 @@ export class AgentRunner {
       const parts = key.split('_');
       const viewport = parts.pop();
       const url = parts.join('_');
-      const relPath = url.replace(this.baseUrl, '/');
+      const relPath = AgentRunner.redactUrl(url.replace(this.baseUrl, '/'));
       md += `- **${relPath}** at **${viewport}** — [View Screenshot](${value})\n`;
     }
     md += `\n`;
 
-    md += `## 📜 History of Actions\n\n`;
-    md += `| Step | Action | Target / Details | Result |\n`;
-    md += `| --- | --- | --- | --- |\n`;
-    this.actionHistory.forEach(h => {
-      const details = h.target ? `\`${h.target}\`` : '-';
-      const resultText = h.result === 'success' ? '✅ Success' : `❌ Failed (${h.error || 'unknown'})`;
-      md += `| ${h.step} | ${h.action} | ${details} | ${resultText} |\n`;
-    });
+    const { table, failureTraces } = this.renderActionHistoryTable();
+    md += `## 📜 Action History\n\n`;
+    md += table + `\n`;
+    if (failureTraces.length > 0) {
+      md += `<details><summary>Full Playwright traces for failed steps</summary>\n${failureTraces}\n</details>\n`;
+    }
 
     fs.writeFileSync(reportPath, md, 'utf-8');
     console.log(`📝 Saved UI/UX audit report to: ${reportPath}`);
@@ -276,31 +427,50 @@ export class AgentRunner {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const reportPath = path.join(reportDir, `security_report_${timestamp}.md`);
 
+    const highCount = this.securityFindings.filter(b => b.severity === 'high').length;
+    const medCount = this.securityFindings.filter(b => b.severity === 'medium').length;
+    const lowCount = this.securityFindings.filter(b => b.severity === 'low').length;
+
     let md = `# Input Security & Validation Report\n\n`;
     md += `- **Date**: ${new Date().toLocaleString()}\n`;
     md += `- **Target Site**: ${this.baseUrl}\n`;
-    md += `- **Observations Logged**: ${this.securityFindings.length}\n\n`;
+    md += `- **Total findings**: ${this.securityFindings.length} (${highCount} P1, ${medCount} P2, ${lowCount} P3)\n\n`;
 
-    md += `## 🛡️ Input Validation & Sanitization Observations\n\n`;
+    md += `## 📋 Findings Summary\n\n`;
     if (this.securityFindings.length === 0) {
       md += `✅ *No input vulnerabilities or boundary issues logged during this audit.*\n\n`;
     } else {
-      md += `| Page URL | Element Selector | Severity | Description | Timestamp |\n`;
-      md += `| --- | --- | --- | --- | --- |\n`;
+      md += `| ID | Type | Severity | Step | Page | One-liner |\n`;
+      md += `| --- | --- | --- | --- | --- | --- |\n`;
       this.securityFindings.forEach(f => {
-        md += `| ${f.url} | \`${f.elementSelector}\` | **${f.severity.toUpperCase()}** | ${f.description} | ${f.timestamp} |\n`;
+        md += `| [${f.id}](#defect-${f.id.toLowerCase()}) | ${f.type} | ${this.severityBadge(f.severity)} | ${f.detectedAtStep} | ${AgentRunner.redactUrl(f.url)} | ${AgentRunner.truncate(f.description, 120)} |\n`;
       });
       md += `\n`;
     }
 
-    md += `## 📜 History of Actions\n\n`;
-    md += `| Step | Action | Target / Details | Result |\n`;
-    md += `| --- | --- | --- | --- |\n`;
-    this.actionHistory.forEach(h => {
-      const details = h.target ? `\`${h.target}\`` : '-';
-      const resultText = h.result === 'success' ? '✅ Success' : `❌ Failed (${h.error || 'unknown'})`;
-      md += `| ${h.step} | ${h.action} | ${details} | ${resultText} |\n`;
-    });
+    md += `## 🛡️ Findings\n\n`;
+    if (this.securityFindings.length === 0) {
+      md += `_None._\n\n`;
+    } else {
+      this.securityFindings.forEach(f => {
+        md += `### <a id="defect-${f.id.toLowerCase()}"></a>${f.id} — ${f.type} (${this.severityBadge(f.severity)})\n\n`;
+        md += `**Where**: step ${f.detectedAtStep} on ${AgentRunner.redactUrl(f.url)}\n\n`;
+        md += `**Element**: \`${f.elementSelector}\`\n\n`;
+        md += `**Description**: ${f.description}\n\n`;
+        md += `**Reproduction trail**\n\n`;
+        md += this.renderReproductionTable(f.reproduction);
+        md += `**Evidence**\n\n`;
+        md += `- Screenshot: ${f.evidenceScreenshot ? `[view](${f.evidenceScreenshot})` : '_unavailable_'}\n`;
+        md += `- Timestamp: ${f.timestamp}\n\n`;
+      });
+    }
+
+    const { table, failureTraces } = this.renderActionHistoryTable();
+    md += `## 📜 Action History\n\n`;
+    md += table + `\n`;
+    if (failureTraces.length > 0) {
+      md += `<details><summary>Full Playwright traces for failed steps</summary>\n${failureTraces}\n</details>\n`;
+    }
 
     fs.writeFileSync(reportPath, md, 'utf-8');
     console.log(`📝 Saved security report to: ${reportPath}`);
@@ -308,6 +478,10 @@ export class AgentRunner {
 
   async runContentAgent(agentInstance: any, maxSteps = 10): Promise<void> {
     console.log(`\n🚀 Starting Content Context & Integrity Audit at: ${this.baseUrl}`);
+
+    // Declared up-front so the new-tab handler's closure resolves to this binding
+    // (handleNewPage is registered before the main loop begins).
+    let lastAction: { action: string; selector: string | null; text: string | null } | null = null;
 
     // Listen for new tab openings
     const context = this.page.context();
@@ -330,9 +504,18 @@ export class AgentRunner {
         // Scan page text for common error cues
         const bodyText = await newPage.locator('body').innerText().catch(() => '');
         
+        const tabScreenshot = screenshotRes.success ? screenshotRes.filePath : undefined;
+        const tabRepro = this.buildReproductionTrail(this.currentStep, newUrl);
+
         // 1. Check for unresolved placeholders in the URL
         if (newUrl.includes('SUBSCRIBER_ID') || newUrl.includes('placeholder')) {
           this.contentBugsLogged.push({
+            id: this.mintDefectId('CB'),
+            type: 'PLACEHOLDER_URL',
+            severity: 'high',
+            detectedAtStep: this.currentStep,
+            reproduction: tabRepro,
+            evidenceScreenshot: tabScreenshot,
             linkText: lastAction?.text || 'External Link',
             expectedTopic: 'Substituted subscriber page URL',
             actualTopic: 'Placeholder URL',
@@ -341,10 +524,16 @@ export class AgentRunner {
             timestamp: new Date().toISOString()
           });
           console.log(`🐞 Logged Content Bug: [New tab has unresolved placeholder: ${newUrl}]`);
-        } 
+        }
         // 2. Check for 404 page errors
         else if (newTitle.includes('404') || newTitle.toLowerCase().includes('not found') || bodyText.toLowerCase().includes('page not found')) {
           this.contentBugsLogged.push({
+            id: this.mintDefectId('CB'),
+            type: 'BROKEN_LINK',
+            severity: 'high',
+            detectedAtStep: this.currentStep,
+            reproduction: tabRepro,
+            evidenceScreenshot: tabScreenshot,
             linkText: lastAction?.text || 'External Link',
             expectedTopic: 'Active target page content',
             actualTopic: '404 Not Found / Error Page',
@@ -368,13 +557,34 @@ export class AgentRunner {
     let currentUrl = this.page.url();
     this.visitedUrls.push(currentUrl);
 
-    let lastAction: { action: string; selector: string | null; text: string | null } | null = null;
+    // Capture baseline auth state. If the test logged in beforehand we expect 'authenticated'
+    // and will treat a later drop to 'anonymous' as a SESSION_DROPPED defect.
+    this.baselineAuthSnapshot = await detectAuthState(this.page);
+    this.expectedAuthState = this.baselineAuthSnapshot.state;
+    console.log(`🔐 Baseline auth state: ${this.expectedAuthState} (cookies: ${this.baselineAuthSnapshot.outsetaCookieCount}, localStorage: ${this.baselineAuthSnapshot.outsetaLocalStorageKeyCount}, loginTriggerVisible: ${this.baselineAuthSnapshot.loginTriggerVisible}, authIndicatorVisible: ${this.baselineAuthSnapshot.authIndicatorVisible})`);
+
     let steps = 0;
 
     while (steps < maxSteps) {
       steps++;
+      this.currentStep = steps;
       console.log(`\n--- Content Agent Step ${steps}/${maxSteps} ---`);
-      // Auto-login helper: if login modal is opened and inputs are visible, fill them automatically!
+
+      // Take screenshot FIRST so the sentinel can attach evidence captured before any remediation.
+      const pageTitleSanitized = (await this.page.title()).replace(/[^a-z0-9]/gi, '_').toLowerCase();
+      const screenshotName = `content_step_${steps}_${pageTitleSanitized}`;
+      const screenshotRes = await takeScreenshot(this.page, screenshotName);
+      if (screenshotRes.success && screenshotRes.filePath) {
+        this.screenshots[currentUrl] = screenshotRes.filePath;
+        this.stepScreenshots[steps] = screenshotRes.filePath;
+      }
+
+      // Session sentinel: was the user silently logged out by the previous action?
+      // Runs BEFORE the auto-login helper so a drop is detected before it gets papered over.
+      await this.checkSessionIntegrity(steps, currentUrl);
+
+      // Auto-login helper: if login modal is opened and inputs are visible, fill them automatically.
+      // The sentinel above has already recorded the drop (if any) before remediation.
       if (await this.page.locator('#o-auth-username').isVisible()) {
         console.log('🔑 Auto-login helper: Login modal detected. Filling credentials...');
         const email = process.env.QA_USER_EMAIL || '';
@@ -388,15 +598,10 @@ export class AgentRunner {
           await this.page.waitForTimeout(1000);
           console.log('🔑 Auto-login helper: Successfully authenticated.');
           currentUrl = this.page.url();
+          // Re-establish the authenticated baseline so we keep watching for further drops.
+          this.expectedAuthState = 'authenticated';
+          this.logoutAcknowledged = false;
         }
-      }
-
-      // Take screenshot
-      const pageTitleSanitized = (await this.page.title()).replace(/[^a-z0-9]/gi, '_').toLowerCase();
-      const screenshotName = `content_step_${steps}_${pageTitleSanitized}`;
-      const screenshotRes = await takeScreenshot(this.page, screenshotName);
-      if (screenshotRes.success && screenshotRes.filePath) {
-        this.screenshots[currentUrl] = screenshotRes.filePath;
       }
 
       // Read page content
@@ -419,6 +624,12 @@ export class AgentRunner {
         const alreadyLogged = this.contentBugsLogged.some(b => b.url === currentUrl && b.description.includes('SoundCloud'));
         if (!alreadyLogged) {
           this.contentBugsLogged.push({
+            id: this.mintDefectId('CB'),
+            type: 'BROKEN_EMBED',
+            severity: 'high',
+            detectedAtStep: steps,
+            reproduction: this.buildReproductionTrail(steps, currentUrl),
+            evidenceScreenshot: this.stepScreenshots[steps],
             linkText: lastAction?.text || 'SoundCloud Embed',
             expectedTopic: 'Valid SoundCloud Audio Player',
             actualTopic: 'SoundCloud URL Error Message',
@@ -445,11 +656,14 @@ export class AgentRunner {
       console.log(`Thought: "${decision.thought}"`);
       console.log(`Action: ${decision.action} | Target: ${decision.target}`);
 
+      const contentElInfo = pageContent.interactiveElements.find(el => el.selector === decision.target);
       this.actionHistory.push({
         step: steps,
         action: decision.action,
         target: decision.target,
-        result: 'success'
+        result: 'success',
+        url: currentUrl,
+        linkText: contentElInfo?.text ?? decision.params?.linkText ?? null,
       });
 
       if (decision.action === 'FINISH') {
@@ -459,16 +673,23 @@ export class AgentRunner {
 
       if (decision.action === 'CLICK' && decision.target) {
         const elInfo = pageContent.interactiveElements.find(el => el.selector === decision.target);
-        
-        // Dead click detection pre-state
-        const preClickUrl = this.page.url();
-        const preClickText = await this.page.locator('body').innerText().catch(() => '');
 
+        // Dead-click detection pre-state. Multi-signal snapshot so we can tell whether
+        // ANYTHING user-observable happened: URL, body text, dialog count, page count, or
+        // a content bug logged by the new-tab listener.
+        const preClickSnapshot = await this.captureClickSnapshot();
+
+        const resolvedLinkText = elInfo ? (elInfo.text || decision.params?.linkText || null) : (decision.params?.linkText || null);
         lastAction = {
           action: 'CLICK',
           selector: decision.target,
-          text: elInfo ? (elInfo.text || decision.params?.linkText || null) : (decision.params?.linkText || null)
+          text: resolvedLinkText
         };
+
+        if (isLogoutIntent(decision.target, resolvedLinkText)) {
+          this.logoutAcknowledged = true;
+          console.log(`🔓 Logout intent recognized — subsequent session drop will be treated as expected.`);
+        }
 
         this.clickedSelectors.push(decision.target);
 
@@ -483,30 +704,58 @@ export class AgentRunner {
           if (!this.visitedUrls.includes(currentUrl)) {
             this.visitedUrls.push(currentUrl);
           }
-          
-          // Dead click detection post-state
-          const postClickText = await this.page.locator('body').innerText().catch(() => '');
-          const isSubmitNews = (lastAction.text || '').toLowerCase().includes('submit news');
-          
-          if (preClickUrl === currentUrl && preClickText === postClickText && isSubmitNews) {
-            const alreadyLogged = this.contentBugsLogged.some(b => b.url === currentUrl && b.linkText.includes('Submit News'));
-            if (!alreadyLogged) {
-              this.contentBugsLogged.push({
-                linkText: lastAction.text || 'Submit News',
-                expectedTopic: 'Navigation to News Submission Form or Modal opening',
-                actualTopic: 'No transition (button is dead)',
-                description: 'Clicking the "Submit News" button/link did not navigate, open a modal, or update page content.',
-                url: currentUrl,
-                timestamp: new Date().toISOString()
-              });
-              console.log(`🐞 Logged Content Bug: [Submit News button is dead on ${currentUrl}]`);
-              lastAction = { action: 'LOG_CONTENT_BUG', selector: null, text: null };
+
+          // Generic dead-click detection (replaces the previous Submit-News-only check).
+          // Only fires on action-like elements (button, input[type=submit], or text containing
+          // an action verb like submit/send/subscribe/etc.) — toggles and dropdowns are excluded.
+          if (isActionLikeElement(elInfo)) {
+            const postClickSnapshot = await this.captureClickSnapshot();
+            const noChange =
+              preClickSnapshot.url === postClickSnapshot.url &&
+              preClickSnapshot.textHash === postClickSnapshot.textHash &&
+              preClickSnapshot.textLength === postClickSnapshot.textLength &&
+              preClickSnapshot.dialogCount === postClickSnapshot.dialogCount &&
+              preClickSnapshot.pageCount === postClickSnapshot.pageCount &&
+              preClickSnapshot.contentBugCount === postClickSnapshot.contentBugCount;
+
+            if (noChange) {
+              const alreadyLogged = this.contentBugsLogged.some(b =>
+                b.type === 'DEAD_CLICK' &&
+                b.url === currentUrl &&
+                (b.linkText === (resolvedLinkText || '') ||
+                  b.reproduction.some(r => r.target === decision.target))
+              );
+              if (!alreadyLogged) {
+                const label = resolvedLinkText || decision.target;
+                this.contentBugsLogged.push({
+                  id: this.mintDefectId('CB'),
+                  type: 'DEAD_CLICK',
+                  severity: 'medium',
+                  detectedAtStep: steps,
+                  reproduction: this.buildReproductionTrail(steps, currentUrl),
+                  evidenceScreenshot: this.stepScreenshots[steps],
+                  linkText: resolvedLinkText || 'Unknown action element',
+                  expectedTopic: 'A visible change: navigation, modal opening, content update, or new tab',
+                  actualTopic: 'No observable change (URL, page text, dialog count, tab count, and bug log all unchanged)',
+                  description: `Clicking the action element "${label}" produced no observable change after 1500ms. The control appears to be unwired or a no-op handler.`,
+                  url: currentUrl,
+                  timestamp: new Date().toISOString()
+                });
+                console.log(`🐞 Logged Content Bug: [Dead click on "${label}" at ${currentUrl}]`);
+                lastAction = { action: 'LOG_CONTENT_BUG', selector: null, text: null };
+              }
             }
           }
         }
       } else if (decision.action === 'LOG_CONTENT_BUG' && decision.params) {
         const { linkText, expectedTopic, actualTopic, description } = decision.params;
         this.contentBugsLogged.push({
+          id: this.mintDefectId('CB'),
+          type: 'CONTENT_MISMATCH',
+          severity: 'medium',
+          detectedAtStep: steps,
+          reproduction: this.buildReproductionTrail(steps, currentUrl),
+          evidenceScreenshot: this.stepScreenshots[steps],
           linkText: linkText || 'Unknown Link',
           expectedTopic: expectedTopic || 'Unknown Expected Topic',
           actualTopic: actualTopic || 'Unknown Actual Content',
@@ -532,6 +781,114 @@ export class AgentRunner {
     await this.saveContentReport();
   }
 
+  private async checkSessionIntegrity(step: number, currentUrl: string): Promise<void> {
+    const snapshot = await detectAuthState(this.page);
+    this.authHistory.push({ step, snapshot });
+
+    if (!this.baselineAuthSnapshot) return;
+    if (this.expectedAuthState !== 'authenticated') return;
+    if (snapshot.state !== 'anonymous') return;
+    if (this.logoutAcknowledged) return;
+
+    const precedingActions: SessionDefectAction[] = this.actionHistory.slice(-6).map(h => ({
+      step: h.step,
+      action: h.action,
+      target: h.target,
+      url: this.visitedUrls[this.visitedUrls.length - 1] || currentUrl,
+    }));
+
+    const baselineScreenshot = this.stepScreenshots[1] ?? (this.baselineAuthSnapshot ? this.screenshots[this.baselineAuthSnapshot.url] : undefined);
+    const failureScreenshot = this.stepScreenshots[step] ?? this.screenshots[currentUrl];
+
+    this.sessionDefects.push({
+      type: 'SESSION_DROPPED',
+      detectedAtStep: step,
+      detectedAtUrl: currentUrl,
+      baselineSnapshot: this.baselineAuthSnapshot,
+      failureSnapshot: snapshot,
+      precedingActions,
+      baselineScreenshot,
+      failureScreenshot,
+      timestamp: new Date().toISOString(),
+    });
+
+    console.log(
+      `🚨 SESSION_DROPPED at step ${step}: was authenticated at ${this.baselineAuthSnapshot.url}, ` +
+      `now anonymous at ${currentUrl} (cookies ${this.baselineAuthSnapshot.outsetaCookieCount} → ${snapshot.outsetaCookieCount}, ` +
+      `loginTriggerVisible: ${snapshot.loginTriggerVisible}).`
+    );
+
+    // Don't re-fire on every subsequent step
+    this.expectedAuthState = 'anonymous';
+  }
+
+  private severityBadge(sev: DefectSeverity): string {
+    if (sev === 'high') return '🔴 P1';
+    if (sev === 'medium') return '🟠 P2';
+    return '🟡 P3';
+  }
+
+  private renderReproductionTable(repro: ReproStep[]): string {
+    if (repro.length === 0) return `_No preceding actions recorded._\n\n`;
+    let s = `| Step | Action | Target | Link text | URL |\n`;
+    s += `| --- | --- | --- | --- | --- |\n`;
+    repro.forEach(a => {
+      const target = a.target ? `\`${AgentRunner.truncate(a.target, 80)}\`` : '-';
+      const text = a.linkText ? `"${AgentRunner.truncate(a.linkText, 60)}"` : '-';
+      s += `| ${a.step} | ${a.action} | ${target} | ${text} | ${AgentRunner.redactUrl(a.url)} |\n`;
+    });
+    return s + `\n`;
+  }
+
+  private renderActionHistoryTable(): { table: string; failureTraces: string } {
+    let table = `| Step | Action | Target | URL | Result |\n`;
+    table += `| --- | --- | --- | --- | --- |\n`;
+    let failureTraces = '';
+    this.actionHistory.forEach(h => {
+      const target = h.target ? `\`${AgentRunner.truncate(h.target, 80)}\`` : '-';
+      const url = h.url ? AgentRunner.redactUrl(h.url) : '-';
+      let resultText: string;
+      if (h.result === 'success') {
+        resultText = '✅ Success';
+      } else {
+        resultText = `❌ ${AgentRunner.firstLine(h.error) || 'failed'}`;
+        if (h.error) {
+          failureTraces += `\n#### Step ${h.step} — full trace\n\n\`\`\`\n${h.error}\n\`\`\`\n`;
+        }
+      }
+      table += `| ${h.step} | ${h.action} | ${target} | ${url} | ${resultText} |\n`;
+    });
+    return { table, failureTraces };
+  }
+
+  private static truncate(s: string, n: number): string {
+    if (s.length <= n) return s;
+    return s.slice(0, n) + '…';
+  }
+
+  // Strip credential-bearing query params (Outseta JWT access tokens, etc.) before
+  // putting URLs into a shareable report. Targets known param names plus a fallback
+  // for any value that looks like a base64-prefixed JWT.
+  private static REDACT_PARAM_REGEX = /([?&])(access_token|id_token|refresh_token|token|jwt|oauth_token|api_key|authorization|password)=([^&#]+)/gi;
+  private static REDACT_JWT_VALUE_REGEX = /=eyJ[A-Za-z0-9_.-]{20,}/g;
+
+  private static redactUrl(url: string | null | undefined): string {
+    if (!url) return url ?? '';
+    return url
+      .replace(AgentRunner.REDACT_PARAM_REGEX, '$1$2=[REDACTED]')
+      .replace(AgentRunner.REDACT_JWT_VALUE_REGEX, '=eyJ[REDACTED]');
+  }
+
+  private sentinelEverEngaged(): boolean {
+    if (this.baselineAuthSnapshot?.state === 'authenticated') return true;
+    return this.authHistory.some(h => h.snapshot.state === 'authenticated');
+  }
+
+  private firstAuthenticatedStep(): number | null {
+    const entry = this.authHistory.find(h => h.snapshot.state === 'authenticated');
+    return entry ? entry.step : null;
+  }
+
   private async saveContentReport() {
     const reportDir = path.resolve(process.cwd(), 'reports');
     if (!fs.existsSync(reportDir)) {
@@ -541,31 +898,106 @@ export class AgentRunner {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const reportPath = path.join(reportDir, `content_report_${timestamp}.md`);
 
+    const totalDefects = this.contentBugsLogged.length + this.sessionDefects.length;
+    const highCount =
+      this.contentBugsLogged.filter(b => b.severity === 'high').length +
+      this.sessionDefects.length; // session drops are always P1
+
+    const sentinelEngaged = this.sentinelEverEngaged();
+    const firstAuthStep = this.firstAuthenticatedStep();
+    let baselineLabel: string;
+    if (this.baselineAuthSnapshot?.state === 'authenticated') {
+      baselineLabel = 'authenticated';
+    } else if (sentinelEngaged && firstAuthStep !== null) {
+      baselineLabel = `${this.baselineAuthSnapshot?.state ?? 'unknown'} (sentinel engaged at step ${firstAuthStep} after auto-login)`;
+    } else {
+      baselineLabel = this.baselineAuthSnapshot?.state ?? 'not captured';
+    }
+
     let md = `# Content Context & Integrity Report\n\n`;
     md += `- **Date**: ${new Date().toLocaleString()}\n`;
     md += `- **Target Site**: ${this.baseUrl}\n`;
-    md += `- **Content Mismatches Logged**: ${this.contentBugsLogged.length}\n\n`;
+    md += `- **Total defects**: ${totalDefects} (${highCount} P1, ${this.contentBugsLogged.filter(b => b.severity === 'medium').length} P2, ${this.contentBugsLogged.filter(b => b.severity === 'low').length} P3)\n`;
+    md += `- **Content mismatches**: ${this.contentBugsLogged.length}\n`;
+    md += `- **Session integrity defects**: ${this.sessionDefects.length}\n`;
+    md += `- **Baseline auth state**: ${baselineLabel}\n\n`;
 
-    md += `## 🐞 Content Mismatches & Broken Redirections Logged\n\n`;
-    if (this.contentBugsLogged.length === 0) {
-      md += `✅ *No semantic content mismatches or target rendering failures were logged.*\n\n`;
+    md += `## 📋 Defect Summary\n\n`;
+    if (totalDefects === 0) {
+      md += `✅ *No defects logged during this run.*\n\n`;
     } else {
-      md += `| Link Text | Expected Content | Actual Content | Discrepancy | Loaded Page URL | Timestamp |\n`;
+      md += `| ID | Type | Severity | Step | Where | One-liner |\n`;
       md += `| --- | --- | --- | --- | --- | --- |\n`;
-      this.contentBugsLogged.forEach(bug => {
-        md += `| "${bug.linkText}" | ${bug.expectedTopic} | ${bug.actualTopic} | ${bug.description} | ${bug.url} | ${bug.timestamp} |\n`;
+      this.sessionDefects.forEach((d, idx) => {
+        const sdNum = String(idx + 1).padStart(3, '0');
+        md += `| [SD-${sdNum}](#defect-sd-${sdNum}) | ${d.type} | 🔴 P1 | ${d.detectedAtStep} | ${AgentRunner.redactUrl(d.detectedAtUrl)} | User was silently logged out mid-journey. |\n`;
+      });
+      this.contentBugsLogged.forEach(b => {
+        md += `| [${b.id}](#defect-${b.id.toLowerCase()}) | ${b.type} | ${this.severityBadge(b.severity)} | ${b.detectedAtStep} | ${AgentRunner.redactUrl(b.url)} | ${AgentRunner.truncate(b.description, 120)} |\n`;
       });
       md += `\n`;
     }
 
-    md += `## 📜 History of Actions\n\n`;
-    md += `| Step | Action | Target / Details | Result |\n`;
-    md += `| --- | --- | --- | --- |\n`;
-    this.actionHistory.forEach(h => {
-      const details = h.target ? `\`${h.target}\`` : '-';
-      const resultText = h.result === 'success' ? '✅ Success' : `❌ Failed (${h.error || 'unknown'})`;
-      md += `| ${h.step} | ${h.action} | ${details} | ${resultText} |\n`;
-    });
+    md += `## 🔐 Session Integrity Defects\n\n`;
+    if (this.sessionDefects.length === 0) {
+      if (sentinelEngaged) {
+        const fromStep = firstAuthStep !== null ? ` from step ${firstAuthStep} onward` : '';
+        md += `✅ *Session remained authenticated for the entire audit. Sentinel was engaged${fromStep}.*\n\n`;
+      } else {
+        md += `ℹ️ *Sentinel was not engaged — no authenticated state was observed during this run.*\n\n`;
+      }
+    } else {
+      this.sessionDefects.forEach((d, idx) => {
+        const sdId = `SD-${String(idx + 1).padStart(3, '0')}`;
+        md += `### <a id="defect-sd-${String(idx + 1).padStart(3, '0')}"></a>${sdId} — ${d.type} (🔴 P1)\n\n`;
+        md += `**Where**: step ${d.detectedAtStep} on ${AgentRunner.redactUrl(d.detectedAtUrl)}\n\n`;
+        md += `**Expected**: Subscriber session persists across the actions below.\n\n`;
+        md += `**Actual**: Session token absent and login trigger visible after step ${d.detectedAtStep}; the user would now have to log in again to continue.\n\n`;
+        md += `**Auth signal comparison**\n\n`;
+        md += `| | Baseline | At failure |\n`;
+        md += `| --- | --- | --- |\n`;
+        md += `| URL | ${AgentRunner.redactUrl(d.baselineSnapshot.url)} | ${AgentRunner.redactUrl(d.failureSnapshot.url)} |\n`;
+        md += `| State | \`${d.baselineSnapshot.state}\` | \`${d.failureSnapshot.state}\` |\n`;
+        md += `| Outseta cookies | ${d.baselineSnapshot.outsetaCookieCount} (${d.baselineSnapshot.outsetaCookieNames.join(', ') || 'none'}) | ${d.failureSnapshot.outsetaCookieCount} (${d.failureSnapshot.outsetaCookieNames.join(', ') || 'none'}) |\n`;
+        md += `| Outseta localStorage keys | ${d.baselineSnapshot.outsetaLocalStorageKeyCount} (${d.baselineSnapshot.outsetaLocalStorageKeys.join(', ') || 'none'}) | ${d.failureSnapshot.outsetaLocalStorageKeyCount} (${d.failureSnapshot.outsetaLocalStorageKeys.join(', ') || 'none'}) |\n`;
+        md += `| Login trigger visible | ${d.baselineSnapshot.loginTriggerVisible} | ${d.failureSnapshot.loginTriggerVisible} |\n`;
+        md += `| Login modal visible | ${d.baselineSnapshot.loginModalVisible} | ${d.failureSnapshot.loginModalVisible} |\n`;
+        md += `| Auth indicator visible | ${d.baselineSnapshot.authIndicatorVisible} | ${d.failureSnapshot.authIndicatorVisible} |\n\n`;
+        md += `**Reproduction trail** (preceding ${d.precedingActions.length} action(s))\n\n`;
+        md += this.renderReproductionTable(d.precedingActions.map(a => ({ ...a, linkText: null })));
+        md += `**Evidence**\n\n`;
+        md += `- Baseline screenshot: ${d.baselineScreenshot ? `[view](${d.baselineScreenshot})` : '_unavailable_'}\n`;
+        md += `- Failure screenshot: ${d.failureScreenshot ? `[view](${d.failureScreenshot})` : '_unavailable_'}\n`;
+        md += `- Timestamp: ${d.timestamp}\n\n`;
+      });
+    }
+
+    md += `## 🐞 Content Defects\n\n`;
+    if (this.contentBugsLogged.length === 0) {
+      md += `✅ *No semantic content mismatches or target rendering failures were logged.*\n\n`;
+    } else {
+      this.contentBugsLogged.forEach(bug => {
+        md += `### <a id="defect-${bug.id.toLowerCase()}"></a>${bug.id} — ${bug.type} (${this.severityBadge(bug.severity)})\n\n`;
+        md += `**Where**: step ${bug.detectedAtStep} on ${AgentRunner.redactUrl(bug.url)}\n\n`;
+        md += `**Link text**: "${bug.linkText}"\n\n`;
+        md += `**Expected**: ${bug.expectedTopic}\n\n`;
+        md += `**Actual**: ${bug.actualTopic}\n\n`;
+        md += `**Description**: ${bug.description}\n\n`;
+        md += `**Reproduction trail** (preceding ${bug.reproduction.length} action(s))\n\n`;
+        md += this.renderReproductionTable(bug.reproduction);
+        md += `**Evidence**\n\n`;
+        md += `- Page screenshot: ${bug.evidenceScreenshot ? `[view](${bug.evidenceScreenshot})` : '_unavailable_'}\n`;
+        md += `- Timestamp: ${bug.timestamp}\n\n`;
+      });
+    }
+
+    const { table, failureTraces } = this.renderActionHistoryTable();
+    md += `## 📜 Action History\n\n`;
+    md += table + `\n`;
+
+    if (failureTraces.length > 0) {
+      md += `<details><summary>Full Playwright traces for failed steps</summary>\n${failureTraces}\n</details>\n`;
+    }
 
     fs.writeFileSync(reportPath, md, 'utf-8');
     console.log(`📝 Saved content audit report to: ${reportPath}`);
