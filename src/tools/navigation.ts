@@ -8,8 +8,12 @@ export async function navigate(page: Page, url: string): Promise<{ success: bool
   try {
     const response = await page.goto(url, { waitUntil: 'load' });
     const currentUrl = page.url();
+    // page.goto returns null when no HTTP request is issued — most commonly a
+    // same-page hash change (e.g. /news#newsletter → /news#insights). Those are
+    // legitimate navigations; the absence of a thrown exception means the
+    // operation completed.
     if (!response) {
-      return { success: false, currentUrl, error: 'Failed to get a response from the page.' };
+      return { success: true, currentUrl };
     }
     const status = response.status();
     if (status >= 400) {
