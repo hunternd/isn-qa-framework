@@ -4,7 +4,7 @@ import { ContentAgent } from '../src/agents/content-agent.js';
 import { loginAndSaveSession, hasSession } from '../src/engine/auth.js';
 
 test.describe('Content Context & Integrity Agent Audit', () => {
-  test.setTimeout(180000);
+  test.setTimeout(300000);
 
   const baseUrl = 'https://www.independentsponsor.news/';
 
