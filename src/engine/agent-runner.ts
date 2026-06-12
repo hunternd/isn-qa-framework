@@ -990,6 +990,40 @@ export class AgentRunner {
     return entry ? entry.step : null;
   }
 
+  // Collapse content bugs that share a root cause (same defect type + same
+  // destination URL host+path + same normalized actualTopic). Multiple
+  // gated-content links all landing on /access-denied with actualTopic
+  // "Access Denied" become one card with N instances instead of N cards.
+  // The underlying contentBugsLogged array is untouched — this is a
+  // render-time view.
+  private static rootCauseKey(bug: ContentBug): string {
+    let urlKey: string;
+    try {
+      const u = new URL(bug.url);
+      urlKey = `${u.host}${u.pathname}`;
+    } catch {
+      urlKey = bug.url;
+    }
+    const topicKey = (bug.actualTopic || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9 ]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 40);
+    return `${bug.type}|${urlKey}|${topicKey}`;
+  }
+
+  private groupContentBugs(): Map<string, ContentBug[]> {
+    const groups = new Map<string, ContentBug[]>();
+    for (const bug of this.contentBugsLogged) {
+      const key = AgentRunner.rootCauseKey(bug);
+      const arr = groups.get(key) ?? [];
+      arr.push(bug);
+      groups.set(key, arr);
+    }
+    return groups;
+  }
+
   private async saveContentReport() {
     const reportDir = path.resolve(process.cwd(), 'reports');
     if (!fs.existsSync(reportDir)) {
@@ -1015,27 +1049,33 @@ export class AgentRunner {
       baselineLabel = this.baselineAuthSnapshot?.state ?? 'not captured';
     }
 
+    const contentGroups = this.groupContentBugs();
+    const distinctContentDefects = contentGroups.size;
+    const distinctTotal = distinctContentDefects + this.sessionDefects.length;
+
     let md = `# Content Context & Integrity Report\n\n`;
     md += `- **Date**: ${new Date().toLocaleString()}\n`;
     md += `- **Target Site**: ${this.baseUrl}\n`;
-    md += `- **Total defects**: ${totalDefects} (${highCount} P1, ${this.contentBugsLogged.filter(b => b.severity === 'medium').length} P2, ${this.contentBugsLogged.filter(b => b.severity === 'low').length} P3)\n`;
-    md += `- **Content mismatches**: ${this.contentBugsLogged.length}\n`;
+    md += `- **Distinct defects**: ${distinctTotal} (${highCount} P1, ${this.contentBugsLogged.filter(b => b.severity === 'medium').length} P2, ${this.contentBugsLogged.filter(b => b.severity === 'low').length} P3)\n`;
+    md += `- **Content defects**: ${distinctContentDefects} distinct (${this.contentBugsLogged.length} instances)\n`;
     md += `- **Session integrity defects**: ${this.sessionDefects.length}\n`;
     md += `- **Baseline auth state**: ${baselineLabel}\n\n`;
 
     md += `## 📋 Defect Summary\n\n`;
-    if (totalDefects === 0) {
+    if (distinctTotal === 0) {
       md += `✅ *No defects logged during this run.*\n\n`;
     } else {
-      md += `| ID | Type | Severity | Step | Where | One-liner |\n`;
-      md += `| --- | --- | --- | --- | --- | --- |\n`;
+      md += `| ID | Type | Severity | Step | Instances | Where | One-liner |\n`;
+      md += `| --- | --- | --- | --- | --- | --- | --- |\n`;
       this.sessionDefects.forEach((d, idx) => {
         const sdNum = String(idx + 1).padStart(3, '0');
-        md += `| [SD-${sdNum}](#defect-sd-${sdNum}) | ${d.type} | 🔴 P1 | ${d.detectedAtStep} | ${AgentRunner.redactUrl(d.detectedAtUrl)} | User was silently logged out mid-journey. |\n`;
+        md += `| [SD-${sdNum}](#defect-sd-${sdNum}) | ${d.type} | 🔴 P1 | ${d.detectedAtStep} | 1 | ${AgentRunner.redactUrl(d.detectedAtUrl)} | User was silently logged out mid-journey. |\n`;
       });
-      this.contentBugsLogged.forEach(b => {
-        md += `| [${b.id}](#defect-${b.id.toLowerCase()}) | ${b.type} | ${this.severityBadge(b.severity)} | ${b.detectedAtStep} | ${AgentRunner.redactUrl(b.url)} | ${AgentRunner.truncate(b.description, 120)} |\n`;
-      });
+      for (const bugs of contentGroups.values()) {
+        const primary = bugs[0]!;
+        const instLabel = bugs.length > 1 ? `${bugs.length} ×` : '1';
+        md += `| [${primary.id}](#defect-${primary.id.toLowerCase()}) | ${primary.type} | ${this.severityBadge(primary.severity)} | ${primary.detectedAtStep} | ${instLabel} | ${AgentRunner.redactUrl(primary.url)} | ${AgentRunner.truncate(primary.description, 120)} |\n`;
+      }
       md += `\n`;
     }
 
@@ -1074,22 +1114,44 @@ export class AgentRunner {
     }
 
     md += `## 🐞 Content Defects\n\n`;
-    if (this.contentBugsLogged.length === 0) {
+    if (contentGroups.size === 0) {
       md += `✅ *No semantic content mismatches or target rendering failures were logged.*\n\n`;
     } else {
-      this.contentBugsLogged.forEach(bug => {
-        md += `### <a id="defect-${bug.id.toLowerCase()}"></a>${bug.id} — ${bug.type} (${this.severityBadge(bug.severity)})\n\n`;
-        md += `**Where**: step ${bug.detectedAtStep} on ${AgentRunner.redactUrl(bug.url)}\n\n`;
-        md += `**Link text**: "${bug.linkText}"\n\n`;
-        md += `**Expected**: ${bug.expectedTopic}\n\n`;
-        md += `**Actual**: ${bug.actualTopic}\n\n`;
-        md += `**Description**: ${bug.description}\n\n`;
-        md += `**Reproduction trail** (preceding ${bug.reproduction.length} action(s))\n\n`;
-        md += this.renderReproductionTable(bug.reproduction);
+      for (const bugs of contentGroups.values()) {
+        const primary = bugs[0]!;
+        const instanceCount = bugs.length;
+        md += `### <a id="defect-${primary.id.toLowerCase()}"></a>${primary.id} — ${primary.type} (${this.severityBadge(primary.severity)})`;
+        if (instanceCount > 1) md += ` — ${instanceCount} instances`;
+        md += `\n\n`;
+        md += `**Where**: step ${primary.detectedAtStep} on ${AgentRunner.redactUrl(primary.url)}\n\n`;
+        md += `**Link text**: "${primary.linkText}"\n\n`;
+
+        if (instanceCount > 1) {
+          md += `**All affected links** (${instanceCount} instances — grouped because they share defect type, destination, and observed outcome):\n\n`;
+          md += `| Instance ID | Step | Link text | Source page |\n`;
+          md += `| --- | --- | --- | --- |\n`;
+          bugs.forEach(b => {
+            const sourceUrl = b.reproduction.length > 0
+              ? b.reproduction[b.reproduction.length - 1]!.url
+              : '-';
+            md += `| ${b.id} | ${b.detectedAtStep} | "${AgentRunner.truncate(b.linkText, 60)}" | ${AgentRunner.redactUrl(sourceUrl)} |\n`;
+          });
+          md += `\n`;
+        }
+
+        md += `**Expected**: ${primary.expectedTopic}\n\n`;
+        md += `**Actual**: ${primary.actualTopic}\n\n`;
+        md += `**Description**: ${primary.description}\n\n`;
+        md += `**Reproduction trail** (first instance, preceding ${primary.reproduction.length} action(s))\n\n`;
+        md += this.renderReproductionTable(primary.reproduction);
         md += `**Evidence**\n\n`;
-        md += `- Page screenshot: ${bug.evidenceScreenshot ? `[view](${bug.evidenceScreenshot})` : '_unavailable_'}\n`;
-        md += `- Timestamp: ${bug.timestamp}\n\n`;
-      });
+        md += `- Page screenshot (first instance): ${primary.evidenceScreenshot ? `[view](${primary.evidenceScreenshot})` : '_unavailable_'}\n`;
+        md += `- First detected: ${primary.timestamp}\n`;
+        if (instanceCount > 1) {
+          md += `- Last detected: ${bugs[bugs.length - 1]!.timestamp}\n`;
+        }
+        md += `\n`;
+      }
     }
 
     const { table, failureTraces } = this.renderActionHistoryTable();
