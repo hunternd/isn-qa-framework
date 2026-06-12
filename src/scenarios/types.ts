@@ -11,6 +11,24 @@ export type Step =
   | { goto: string }
   | { click: { kind: ContentKind; nth?: number } }
   | { clickSelector: string }
+  // Hover a selector. Useful for Webflow-style nav dropdowns that open on
+  // hover rather than click — without this, scripting "open dropdown then
+  // click item" requires force-clicking hidden elements.
+  | { hoverSelector: string }
+  // Invoke the DOM click handler directly via element.click() in page.evaluate.
+  // Bypasses Playwright's visibility/intercept retry layer, which is the only
+  // way to reach nav dropdown items that close before the click lands. Useful
+  // for reproducing user-reported bugs where the click TARGET matters (event
+  // handlers, auth checks attached to nav links) but the precise interaction
+  // model is hard to replay through the page surface.
+  | { clickDirect: string }
+  // Atomic hover-then-click. For Webflow-style nav dropdowns that open on
+  // hover and close when the mouse leaves: a separate hoverSelector then
+  // clickSelector loses the hover state between commands, leaving the dropdown
+  // closed by the time the click locator is resolved. This combines both into
+  // one step so Playwright moves the mouse straight from the hover target to
+  // the click target while the dropdown is still open.
+  | { hoverThenClick: { hover: string; click: string } }
   | { back: true }
   | { ensureAuth: true }
   | { verify: 'still-authenticated' };
