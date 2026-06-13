@@ -24,7 +24,7 @@ export class UIAgent {
     } else {
       this.anthropic = new Anthropic({ apiKey });
     }
-    this.model = process.env.ANTHROPIC_MODEL || 'claude-3-5-sonnet-20241022';
+    this.model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
   }
 
   async decideNextAction(
