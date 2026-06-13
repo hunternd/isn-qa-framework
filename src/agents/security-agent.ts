@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type { PageContent } from '../tools/navigation.js';
 import * as dotenv from 'dotenv';
+import { DEFAULT_MODEL } from './config.js';
 
 dotenv.config();
 
@@ -24,7 +25,7 @@ export class SecurityAgent {
     } else {
       this.anthropic = new Anthropic({ apiKey });
     }
-    this.model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
+    this.model = process.env.ANTHROPIC_MODEL || DEFAULT_MODEL;
   }
 
   async decideNextAction(
